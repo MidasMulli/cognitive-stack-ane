@@ -230,7 +230,15 @@ def repl(streaming=True):
     try:
         while True:
             try:
-                line = input(f"{BOLD}{GREEN}you{RESET}{DIM} ›{RESET} ")
+                # M53: wrap ANSI escapes in readline's non-printing markers
+                # (\x01...\x02) so readline computes the correct cursor
+                # position. Without these, long input or history navigation
+                # cuts off mid-line because readline counts the color codes
+                # as visible characters.
+                _p = lambda s: f"\x01{s}\x02" if s else ""
+                prompt = (f"{_p(BOLD)}{_p(GREEN)}you{_p(RESET)}"
+                          f"{_p(DIM)} \u203a{_p(RESET)} ")
+                line = input(prompt)
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
@@ -264,7 +272,36 @@ def repl(streaming=True):
                     except Exception as e:
                         print(f"{RED}reset failed: {e}{RESET}")
                 elif cmd == "help":
-                    print(f"{DIM}  /memories /no-memories /stats /clear /reset /exit{RESET}")
+                    # REPL slash commands (run inside this terminal client).
+                    print()
+                    print(f"{BOLD}REPL slash commands{RESET}{DIM} (inside this terminal){RESET}")
+                    print(f"{DIM}  /memories        {RESET}show recalled memories after each reply")
+                    print(f"{DIM}  /no-memories     {RESET}hide recalled memories (default)")
+                    print(f"{DIM}  /stats           {RESET}toggle ttft / total / tps / accept-rate line")
+                    print(f"{DIM}  /clear           {RESET}clear the terminal screen")
+                    print(f"{DIM}  /reset           {RESET}reset server-side session history (POST /api/chat/reset)")
+                    print(f"{DIM}  /help            {RESET}show this help")
+                    print(f"{DIM}  /exit /quit :q   {RESET}exit the terminal client (midas_ui stays up)")
+                    print()
+                    # Bash launcher flags (run from shell, exit the REPL first).
+                    print(f"{BOLD}Bash launcher flags{RESET}{DIM} (run from shell, not inside REPL){RESET}")
+                    print(f"{DIM}  midas                    {RESET}start interactive REPL")
+                    print(f"{DIM}  midas \"question\"         {RESET}one-shot, prints reply and exits")
+                    print(f"{DIM}  midas --memories \"msg\"   {RESET}one-shot + show recalled memories")
+                    print(f"{DIM}  midas --json \"msg\"       {RESET}one-shot, raw JSON dump")
+                    print(f"{DIM}  midas --no-stream \"msg\"  {RESET}non-streaming fallback (hits /api/chat)")
+                    print(f"{DIM}  midas --ui               {RESET}open the web UI in Safari")
+                    print(f"{DIM}  midas --status           {RESET}show all four service health at a glance")
+                    print(f"{DIM}  midas --start-server     {RESET}start midas_ui :8450 if down")
+                    print(f"{DIM}  midas --restart          {RESET}end current session cleanly + relaunch midas_ui")
+                    print(f"{DIM}  midas --end-session      {RESET}SIGTERM midas_ui (writes session summary, no relaunch)")
+                    print(f"{DIM}  midas --help             {RESET}show the bash launcher docstring")
+                    print()
+                    print(f"{DIM}  --restart / --end-session trigger the atexit/signal handler that")
+                    print(f"  writes data/session_summaries/session_<TS>.json and finalizes the")
+                    print(f"  per-turn log directory. Next midas_ui boot loads it as the PRIOR")
+                    print(f"  SESSION bridge on turn 1 and runs auto-populate registry.{RESET}")
+                    print()
                 else:
                     print(f"{DIM}unknown command: {line}{RESET}")
                 continue

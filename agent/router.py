@@ -415,7 +415,12 @@ def extract_search_query(msg):
     q = re.sub(r'^(is there any |are there any |have there been any |'
                r'do you see any |can you find |can you search for |'
                r'any recent |any new )', '', q, flags=re.I)
-    q = re.sub(r'^(what is|what are|who is|where is|how is|how do|when did)\s+',
+    q = re.sub(r"^(what'?s|what is|what are|who'?s|who is|where'?s|where is|"
+               r"how'?s|how is|how do|when did|when'?s|when is)\s+",
+               '', q, flags=re.I)
+    q = re.sub(r'\s+(right now|currently|today|at the moment|these days)$',
+               '', q, flags=re.I)
+    q = re.sub(r'\s+for the next \d+ (days?|hours?|weeks?|months?)$',
                '', q, flags=re.I)
     # Trailing "that relates to our research" / "for our work" — these
     # are source-binding phrases that don't help Google. Strip them.
@@ -862,6 +867,10 @@ _WEB_SEARCH_OVERRIDE = (
     "do a search on", "search on google", "look it up online",
     "search the internet", "do a web search", "google for",
     "go online and search", "can you search online",
+    "search arxiv", "search on arxiv", "check arxiv",
+    "search reddit", "check reddit", "look on reddit",
+    "search hacker news", "check hacker news", "look on hacker news",
+    "check hn", "look on hn",
 )
 
 

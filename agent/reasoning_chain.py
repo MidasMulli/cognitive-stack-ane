@@ -14,14 +14,24 @@ Triggered by signal_bus reasoning_mode:
 """
 
 
-def chain_of_reasoning(llm_fn, query, context, system_base=""):
+def chain_of_reasoning(llm_fn, query, context, system_base="", max_tokens=None):
     """Multi-step reasoning for analytical queries.
 
     Cost: 3x generation time. Use only for analytical/debugging queries.
 
+    Args:
+        llm_fn: callable(messages, max_tokens, temperature) -> str
+        query: user query
+        context: retrieved context string
+        system_base: system prompt base (with standing rules already injected)
+        max_tokens: optional cap for the user-facing synthesis step.
+            Internal scratch-pad steps (decomposition, reasoning) keep
+            their default budgets — only the final synthesis is the
+            user-facing output that needs the standing-rule cap. Main 40 P1.
+
     Returns: synthesized response string
     """
-    # Step 1: Decompose (max 200 tokens)
+    # Step 1: Decompose (max 200 tokens) — internal scratch, not capped
     decompose_prompt = [
         {"role": "system", "content":
          system_base + "\nBreak this into 2-3 specific sub-questions. "
@@ -33,7 +43,7 @@ def chain_of_reasoning(llm_fn, query, context, system_base=""):
 
     decomposition = llm_fn(decompose_prompt, max_tokens=200, temperature=0.1)
 
-    # Step 2: Reason (max 600 tokens)
+    # Step 2: Reason (max 600 tokens) — internal scratch, not capped
     reason_prompt = [
         {"role": "system", "content":
          system_base + "\nAnswer each sub-question with specific reasoning. "
@@ -45,7 +55,7 @@ def chain_of_reasoning(llm_fn, query, context, system_base=""):
 
     reasoning = llm_fn(reason_prompt, max_tokens=600, temperature=0.3)
 
-    # Step 3: Synthesize (max 400 tokens)
+    # Step 3: Synthesize — user-facing, applies the standing-rule cap.
     synth_prompt = [
         {"role": "system", "content":
          system_base + "\nSynthesize a clear final response from the reasoning below. "
@@ -54,7 +64,8 @@ def chain_of_reasoning(llm_fn, query, context, system_base=""):
          f"Original question: {query}\n\nReasoning:\n{reasoning}"},
     ]
 
-    synthesis = llm_fn(synth_prompt, max_tokens=400, temperature=0.3)
+    synth_max = max_tokens if max_tokens is not None else 400
+    synthesis = llm_fn(synth_prompt, max_tokens=synth_max, temperature=0.3)
 
     return synthesis
 

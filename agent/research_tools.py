@@ -20,6 +20,13 @@ from pathlib import Path
 # reads of arbitrary FS regions.
 COWORK_ROOT = Path("/Users/midas/Desktop/cowork").resolve()
 VAULT_ROOT = COWORK_ROOT / "vault"
+# Main 33: extend the sandbox to include Claude's auto-memory directory.
+# Without this, Researcher's read_file/grep can't reach finding_*.md files
+# that the wikilink_index references via paths like
+# ~/.claude/projects/-Users-midas/memory/. The auto-memory directory is
+# treated as a second sandbox root: paths under either root are accepted.
+AUTO_MEMORY_ROOT = Path("/Users/midas/.claude/projects/-Users-midas/memory").resolve()
+SANDBOX_ROOTS = [COWORK_ROOT, AUTO_MEMORY_ROOT]
 MAX_FILE_BYTES = 200_000   # ~5K lines at 40 chars; truncate above
 MAX_GREP_MATCHES = 200     # head_limit equivalent
 MAX_LIST_ENTRIES = 300
@@ -52,22 +59,47 @@ def _ensure_basename_index():
     return idx
 
 
+def _relative_to_sandbox(p: Path) -> Path:
+    """Return p as a path relative to whichever sandbox root contains it.
+    Falls back to COWORK_ROOT for legacy callers; raises ValueError if neither.
+    """
+    for root in SANDBOX_ROOTS:
+        try:
+            return p.relative_to(root)
+        except ValueError:
+            continue
+    raise ValueError(f"{p} is not under any sandbox root")
+
+
 def _safe_resolve(path_str: str) -> Path | None:
-    """Resolve path_str against COWORK_ROOT. Reject anything outside."""
+    """Resolve path_str against the sandbox roots. Reject anything outside.
+
+    Accepts paths under COWORK_ROOT (the project tree) OR AUTO_MEMORY_ROOT
+    (Claude's auto-memory directory at ~/.claude/projects/-Users-midas/memory).
+    Relative paths are first resolved against COWORK_ROOT for backward
+    compatibility — auto-memory must be referenced by absolute path or by the
+    `~/.claude/...` form.
+    """
     if not path_str:
         return None
-    p = Path(path_str)
+    # Expand ~ for the auto-memory shorthand
+    expanded = path_str
+    if expanded.startswith("~"):
+        expanded = str(Path(expanded).expanduser())
+    p = Path(expanded)
     if not p.is_absolute():
         p = COWORK_ROOT / p
     try:
         resolved = p.resolve()
     except (OSError, RuntimeError):
         return None
-    try:
-        resolved.relative_to(COWORK_ROOT)
-    except ValueError:
-        return None
-    return resolved
+    for root in SANDBOX_ROOTS:
+        try:
+            resolved.relative_to(root)
+            return resolved
+        except ValueError:
+            continue
+    return None
 
 
 def tool_grep(pattern: str, glob: str | None = None, path: str | None = None) -> str:
@@ -146,7 +178,7 @@ def tool_read_file(path: str, offset: int = 1, limit: int = 200) -> str:
     if not chunk:
         return f"ERROR: offset {start_line} is past EOF (file has {total} lines, {size} bytes)"
 
-    rel = str(p.relative_to(COWORK_ROOT))
+    rel = str(_relative_to_sandbox(p))
     actual_end = start_line + len(chunk) - 1
     total_str = f"{total}" if total > 0 else "unknown (very large file, scan stopped)"
     header = f"{rel} (lines {start_line}-{actual_end} of {total_str}, file {size} B)"
@@ -174,7 +206,7 @@ def tool_list_dir(path: str = ".") -> str:
         tail = f"\n... ({truncated} more entries truncated)"
     else:
         tail = ""
-    rel = str(p.relative_to(COWORK_ROOT)) or "."
+    rel = str(_relative_to_sandbox(p)) or "."
     lines = [f"{rel}/ ({len(entries)} entries shown)"]
     for e in entries:
         try:
@@ -215,7 +247,7 @@ def tool_follow_wikilinks(path: str) -> str:
     pattern = re.compile(r'(?<!\!)\[\[([^\]|#]+?)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]')
     raw = pattern.findall(text)
     if not raw:
-        rel = p.relative_to(COWORK_ROOT) if str(p).startswith(str(COWORK_ROOT)) else p
+        rel = _relative_to_sandbox(p) if str(p).startswith(str(COWORK_ROOT)) else p
         return f"NO WIKI-LINKS in {rel}"
 
     # Dedupe while preserving order
@@ -228,7 +260,7 @@ def tool_follow_wikilinks(path: str) -> str:
             ordered.append(r)
 
     idx = _ensure_basename_index()
-    rel = p.relative_to(COWORK_ROOT) if str(p).startswith(str(COWORK_ROOT)) else p
+    rel = _relative_to_sandbox(p) if str(p).startswith(str(COWORK_ROOT)) else p
     lines = [f"{rel} → {len(ordered)} unique wiki-links:"]
     resolved_count = 0
     broken_count = 0
@@ -352,9 +384,106 @@ Cite file:line for every code claim. If you cannot verify a claim, say so
 explicitly — do not guess. Memory recall is for priors and context; for any
 claim about current code state, you MUST verify with grep or read_file.
 
+═══════════════════════════════════════════════════════════════════════════
+TOOL ORDER MATTERS — read this carefully:
+═══════════════════════════════════════════════════════════════════════════
+
+For ANY question of the form "what is the current/latest/measured value of X"
+or "what does the project currently believe about X" or "is X dead/alive/open":
+
+  >>> CALL recall_memory FIRST. <<<
+
+The Subconscious memory store contains curated finding files (source_role
+"claude_automemory") that hold the CORRECTED, CURRENT understanding of
+research findings. These are written by Claude across sessions and represent
+the latest verified state. Many of them REVISE earlier vault content that
+is no longer accurate.
+
+If you skip recall_memory and go straight to follow_wikilinks → read_file,
+you will read OLD vault files that contain superseded numbers. Researcher
+v1 has been observed reporting wrong numbers from outdated vault files
+when the corrected finding existed in Subconscious — recall_memory would
+have surfaced the right answer immediately.
+
+The recall_memory result will include a `source` field for each memory.
+For high-confidence claude_automemory results, the source is an absolute
+path like "/Users/midas/.claude/projects/-Users-midas/memory/finding_X.md".
+USE THAT PATH with read_file to verify the headline claim. Do not grep
+for similar numbers in other vault files — they may be old.
+
+Recommended sequence for "what is X" questions:
+  1. recall_memory("X")                    — surface current findings
+  2. read_file(top_result.source)          — verify the headline claim
+  3. (only if needed) grep / follow_wikilinks for cross-references
+
+For "where is the file that contains Y" questions, follow_wikilinks /
+list_dir / grep are still the right starting tools.
+
+For "has X been tried before" or "what dead paths involve X" questions,
+recall_memory is also the right starting tool — the dead-paths table
+is in Subconscious as canonical entries.
+
+═══════════════════════════════════════════════════════════════════════════
+SEARCH COVERAGE — where to grep for production / server / hit-rate questions:
+═══════════════════════════════════════════════════════════════════════════
+
+For questions about "production traffic", "hit rate", "server status",
+"is X working in production", "what does the live system do":
+
+  - CLAUDE.md (cowork root) holds current production-stack state and is
+    where shipped features are documented. ALWAYS grep CLAUDE.md before
+    answering "is X confirmed working" — the answer is often there verbatim.
+  - ngram-engine/qwen_spec_decode_server.py is the 72B verifier server
+    (prefix cache, KV cache, spec decode wiring).
+  - ane-compiler/ane_server_8b.py is the 8B ANE extraction server.
+  - orion-ane/agent/midas_ui.py is the Midas UI (memory injection,
+    research delegation).
+
+If recall_memory returns nothing useful for a "is X working in production"
+question, your next call should be:
+  TOOL_CALL: {"tool": "grep", "args": {"pattern": "<topic keywords>", "path": "CLAUDE.md"}}
+NOT a vault search. CLAUDE.md is the source of truth for production state.
+
+═══════════════════════════════════════════════════════════════════════════
+
 Recommended search pattern for "what does the vault know about topic X":
   1. follow_wikilinks vault/CLAUDE.md            — find the right folder INDEX
   2. follow_wikilinks vault/<folder>/INDEX.md    — find the relevant file
   3. read_file <that file>                       — get the content
 This is 3 tool calls and avoids any blind grep cycles.
+
+Recommended sequence for "what is the current value of X" questions:
+  1. recall_memory "X current value"             — surface curated findings
+  2. read_file <source path from top result>    — verify the claim
+  3. report the verified number with citation
+This is 2-3 tool calls and avoids relying on stale vault files.
+
+═══════════════════════════════════════════════════════════════════════════
+CRITICAL: DO NOT PARAPHRASE THE USER'S QUERY when calling recall_memory.
+═══════════════════════════════════════════════════════════════════════════
+
+When you call recall_memory, your FIRST query MUST use the user's verbatim
+words from the research goal. Do NOT shorten, summarize, or rephrase. The
+embedding model matches on lexical and semantic overlap; paraphrased
+queries can miss findings whose authors used the user's exact words.
+
+WRONG (paraphrased):
+  recall_memory("8B fused path integration")
+RIGHT (verbatim):
+  recall_memory("Is wiring the existing fused 8B path into production a 5-minute config flip or multi-day work?")
+
+WRONG (shortened):
+  recall_memory("MACC0 status")  ← only do this AFTER the verbatim call returned nothing useful
+RIGHT (verbatim):
+  recall_memory("What is the current verified status of MACC0 on M5 Pro?")
+
+If the verbatim call returns weak results, you MAY follow up with shorter
+keyword queries — but only as the second or third call, never the first.
+
+When the source field of a recall_memory result points to an absolute path
+under /Users/midas/.claude/projects/-Users-midas/memory/, that file IS in
+your sandbox — read it directly with read_file. Do NOT make up filenames
+based on the topic; use the source path exactly as given.
+
+═══════════════════════════════════════════════════════════════════════════
 """

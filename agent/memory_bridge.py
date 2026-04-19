@@ -35,16 +35,29 @@ class MemoryBridge:
         self.daemon.start()
         self._started = True
 
-    def ingest(self, role, text):
+    def run_maintenance_if_idle(self):
+        """M50 P1: proxy to daemon's idle maintenance for CPU decode window."""
+        if not self._started or not self.daemon:
+            return False
+        if hasattr(self.daemon, 'run_maintenance_if_idle'):
+            return self.daemon.run_maintenance_if_idle()
+        return False
+
+    def ingest(self, role, text, recall_context=None):
         if not self._started:
             return {"error": "daemon not started"}
-        self.daemon.ingest(role, text)
+        self.daemon.ingest(role, text, recall_context=recall_context)
         time.sleep(0.3)
         s = self.daemon.stats
-        return {"status": "stored", "extracted": s["extracted"],
-                "stored": s["stored"], "total_memories": s["total_memories"]}
+        # Main 45: include discarded ungrounded facts for turn logging
+        discarded = self.daemon.last_discarded_ungrounded
+        result = {"status": "stored", "extracted": s["extracted"],
+                  "stored": s["stored"], "total_memories": s["total_memories"]}
+        if discarded:
+            result["discarded_ungrounded"] = discarded
+        return result
 
-    def recall(self, query, n_results=5, type_filter=""):
+    def recall(self, query, n_results=5, type_filter="", context_boost=None):
         """Multi-path retrieval with in-method fallback to flat cosine.
 
         Main 24 Build 0: route through `multi_path_recall` (5-signal fusion +
@@ -73,6 +86,8 @@ class MemoryBridge:
                 # the fusion stage where the META_BOOST + recency signals can
                 # surface them.
                 candidate_pool=max(100, n_results * 6),
+                # Main 43 Phase 3: pass topic boost from ContextTracker
+                context_boost=context_boost,
             )
             if mp_results:
                 results = []

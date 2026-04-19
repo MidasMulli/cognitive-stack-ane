@@ -22,6 +22,7 @@ Provides 8 tools:
 """
 
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -40,14 +41,79 @@ class BrowserBridge:
         self._tab = None
 
     def is_available(self) -> bool:
-        """Check if Chrome CDP is running."""
+        """Check if Chrome CDP is running. If not, try to launch it."""
         try:
             resp = urllib.request.urlopen(
                 f"http://{CDP_HOST}:{CDP_PORT}/json/version", timeout=1
             )
             return resp.status == 200
         except (urllib.error.URLError, OSError):
+            pass
+        # Chrome not running — try to launch headless
+        return self._auto_launch()
+
+    def _auto_launch(self) -> bool:
+        """Launch Chrome headless with CDP for web search.
+
+        Main 38 Session 2 fix: use the persistent `~/.chrome-debug`
+        profile (matching the docstring at the top of this file)
+        instead of a fresh tempfile.mkdtemp directory. The ephemeral
+        tmp profile made X/Reddit/auth-gated sites effectively unusable
+        because cookies got thrown away on every midas_ui restart.
+        Session 2 hit this: three browse_x_feed calls returned "Not
+        logged into X" even though the user had logged in earlier in
+        an ephemeral profile that was subsequently discarded.
+        The persistent profile lets the user log in ONCE and have
+        browse_x_feed return real content across restarts.
+        """
+        import subprocess
+        chrome_paths = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+        chrome = None
+        for p in chrome_paths:
+            if os.path.exists(p):
+                chrome = p
+                break
+        if not chrome:
             return False
+        profile_dir = os.path.expanduser("~/.chrome-debug")
+        os.makedirs(profile_dir, exist_ok=True)
+        try:
+            subprocess.Popen(
+                [chrome,
+                 # No --headless: we want a visible window the user can
+                 # interact with to complete auth flows (X login, etc).
+                 # The window stays open in the background for cookie
+                 # persistence; browse_x_feed / browse_search drive it
+                 # via CDP without requiring user interaction once
+                 # auth is done.
+                 f"--remote-debugging-port={CDP_PORT}",
+                 f"--remote-allow-origins=*",
+                 f"--user-data-dir={profile_dir}",
+                 "--no-first-run",
+                 "--no-default-browser-check",
+                 ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            # Wait for CDP to come up
+            for _ in range(10):
+                time.sleep(0.5)
+                try:
+                    resp = urllib.request.urlopen(
+                        f"http://{CDP_HOST}:{CDP_PORT}/json/version", timeout=1
+                    )
+                    if resp.status == 200:
+                        print("[browser] auto-launched Chrome headless for web search", flush=True)
+                        return True
+                except (urllib.error.URLError, OSError):
+                    continue
+        except Exception as e:
+            print(f"[browser] auto-launch failed: {e}", flush=True)
+        return False
 
     def connect(self):
         """Connect to Chrome CDP."""
@@ -270,16 +336,23 @@ class BrowserBridge:
         except Exception as e:
             return {"error": str(e)}
 
-    def scan_x_feed(self, count: int = 5) -> dict:
+    def scan_x_feed(self, count: int = 5, handle: str = None) -> dict:
         """Navigate to X/Twitter, extract top tweets from the feed.
 
-        Handles all the DOM complexity internally — tries multiple selectors,
-        scrolls for content, extracts structured tweet data. One call, done.
+        If `handle` is provided, navigate to that user's profile page
+        (https://x.com/<handle>) and scrape their posts. Otherwise scrape
+        the home timeline. Handles all the DOM complexity internally —
+        tries multiple selectors, scrolls for content, extracts structured
+        tweet data. One call, done.
         """
         self._ensure_tab()
         try:
-            # Navigate to X home feed
-            self._tab.Page.navigate(url="https://x.com/home")
+            if handle:
+                clean = handle.lstrip("@").strip()
+                target_url = f"https://x.com/{clean}"
+            else:
+                target_url = "https://x.com/home"
+            self._tab.Page.navigate(url=target_url)
             time.sleep(3)  # X is slow to hydrate
 
             # Check for auth wall
@@ -566,11 +639,12 @@ BROWSER_TOOLS = [
         "type": "function",
         "function": {
             "name": "browse_x_feed",
-            "description": "Scan X/Twitter feed and return top tweets with author, text, and engagement. One call — handles navigation, scrolling, and DOM extraction automatically. Use this instead of browse_navigate for X feed scanning.",
+            "description": "Scan X/Twitter and return top tweets with author, text, and engagement. If `handle` is provided, scrapes that user's profile page (https://x.com/<handle>); otherwise scrapes the home timeline. One call handles navigation, scrolling, and DOM extraction. Use the handle form for any 'posts from <user>' / '@<user>' query.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "count": {"type": "integer", "description": "Number of tweets to return (default 5)", "default": 5}
+                    "count": {"type": "integer", "description": "Number of tweets to return (default 5)", "default": 5},
+                    "handle": {"type": "string", "description": "X username (without @) to scrape posts from. Omit for home timeline."}
                 },
             }
         }

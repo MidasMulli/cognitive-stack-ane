@@ -93,32 +93,116 @@ TOOLS = [
 VAULT_PATH = "/Users/midas/Desktop/cowork/vault"
 
 def vault_read(path: str = "", query: str = "") -> dict:
-    """Read files or search the Obsidian vault. Read-only."""
+    """Read files or search the Obsidian vault. Read-only.
+
+    Main 38 P1 fix: vault_read no longer matches CC's internal meta
+    files (state synthesis, agent_reports, memory/ daemon space).
+    These files exist to give CC context at session open and to
+    document investigations across sessions. Serving them to the
+    72B via tool_result has been shown to cause hallucination-by-
+    association: the 72B reads CC's documentation of a bug (which
+    quotes the fabrication strings verbatim as examples) and regurgi-
+    tates the strings as canonical knowledge in the next response.
+    See Main 38 P1 investigation report.
+    """
+    # Meta/internal paths that must never appear in vault_read results.
+    # Relative to VAULT_PATH, leading components compared via startswith.
+    _VAULT_READ_SKIP_PREFIXES = (
+        "memory/",                       # daemon space, entity files, facts/
+        "agent_reports/",                # CC investigation reports
+        "subconscious/",                 # event logs, daemon state
+        "subconscious_state_synthesis",  # CC session-open context anchor
+        "CLAUDE_session_log",            # session log (append-only)
+        "MANIFEST",                      # vault_agent internals
+        ".wikilink_index",               # index json
+        # Main 38 Session 2 addition: Roadmap.md is a mirror file that
+        # drifts from CLAUDE.md (was 16 days stale at detection time) and
+        # surfaced Main-22-era stale content ("ChromaDB", "4,677 memories",
+        # "Living Model Revival", "2C feature flag") on status queries in
+        # both Session 1 and Session 2. Hand-maintained mirrors of
+        # authoritative sources do not belong in tool_result content.
+        # Human readers can still open Roadmap.md directly in Obsidian;
+        # the skip only applies to the query-based vault_read search path.
+        "Roadmap.md",
+    )
+
+    def _is_meta_file(rel_path: str) -> bool:
+        return any(rel_path.startswith(p) for p in _VAULT_READ_SKIP_PREFIXES)
+
     if query:
-        # Search across all markdown files
-        matches = []
+        # Search across all markdown files. Main 40: keyword-based
+        # matching instead of full-substring. Split the query into
+        # words, score each file by how many query keywords appear
+        # in its content, rank by score. This fixes the M40 retrieval
+        # misses where "main 38 shipped" failed to match a file
+        # containing "## Main 38" because the three-word substring
+        # wasn't contiguous, and "list the top 5 dead paths and why
+        # they were killed" failed to match "## Dead Paths".
+        query_lower = query.lower()
+        # Extract meaningful keywords (skip stopwords, keep numbers)
+        _STOPWORDS = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at',
+            'to', 'for', 'of', 'with', 'by', 'from', 'is', 'are',
+            'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had',
+            'do', 'does', 'did', 'will', 'would', 'could', 'should',
+            'may', 'might', 'can', 'shall', 'not', 'no', 'nor',
+            'so', 'if', 'then', 'than', 'that', 'this', 'these',
+            'those', 'it', 'its', 'we', 'our', 'they', 'them',
+            'what', 'which', 'who', 'whom', 'how', 'why', 'when',
+            'where', 'all', 'each', 'every', 'both', 'few', 'more',
+            'most', 'other', 'some', 'such', 'only', 'own', 'same',
+            'too', 'very', 'just', 'about', 'above', 'after',
+            'again', 'also', 'any', 'because', 'before', 'between',
+            'up', 'out', 'off', 'over', 'under', 'into', 'through',
+            'list', 'explain', 'describe', 'tell', 'show', 'give',
+        }
+        keywords = [w for w in query_lower.split()
+                     if w not in _STOPWORDS and len(w) > 1]
+        if not keywords:
+            keywords = query_lower.split()[:3]
+
+        scored_matches = []
         for md_file in globmod.glob(os.path.join(VAULT_PATH, "**/*.md"), recursive=True):
-            # Skip memory/ subdirectory (that's the daemon's space)
             rel = os.path.relpath(md_file, VAULT_PATH)
+            if _is_meta_file(rel):
+                continue
             try:
                 with open(md_file, "r") as f:
                     content = f.read()
-                if query.lower() in content.lower():
-                    # Extract matching lines with context
-                    lines = content.split("\n")
-                    snippets = []
-                    for i, line in enumerate(lines):
-                        if query.lower() in line.lower():
-                            start = max(0, i - 1)
-                            end = min(len(lines), i + 2)
-                            snippets.append("\n".join(lines[start:end]))
-                    matches.append({
-                        "file": rel,
-                        "snippets": snippets[:3],  # top 3 matches per file
-                    })
+                content_lower = content.lower()
+                # Score: count how many keywords appear in content
+                hits = sum(1 for kw in keywords if kw in content_lower)
+                if hits == 0:
+                    continue
+                # Bonus: full query substring match
+                full_match = query_lower in content_lower
+                score = hits + (len(keywords) if full_match else 0)
+                # Boost knowledge/ files — these are curated
+                # authoritative sources, not session notes
+                if rel.startswith("knowledge/"):
+                    score += 2
+                # Extract matching lines
+                lines = content.split("\n")
+                snippets = []
+                for i, line in enumerate(lines):
+                    line_lower = line.lower()
+                    if any(kw in line_lower for kw in keywords):
+                        start = max(0, i - 1)
+                        end = min(len(lines), i + 2)
+                        snippets.append("\n".join(lines[start:end]))
+                scored_matches.append({
+                    "file": rel,
+                    "snippets": snippets[:3],
+                    "_score": score,
+                    "_hits": hits,
+                    "_total_kw": len(keywords),
+                })
             except Exception:
                 continue
-        return {"query": query, "matches": matches[:10]}
+        # Sort by score descending, return top 10
+        scored_matches.sort(key=lambda m: m["_score"], reverse=True)
+        matches = scored_matches[:10]
+        return {"query": query, "matches": matches}
 
     if not path:
         # List vault structure

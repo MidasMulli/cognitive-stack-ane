@@ -49,7 +49,10 @@ from aiohttp import web, WSMsgType  # noqa: E402
 import queue_persistence as qp  # noqa: E402
 
 # ── Configuration ───────────────────────────────────────────────────────────
-PORT = 8452
+# Port is env-configurable. 8452 is the original default but the
+# Cloudflare MCP tunnel now owns it (subconsciousmcp.com -> :8452).
+# Viz expects 8454 by default, override via DAEMON_PORT=NNNN.
+PORT = int(os.environ.get("DAEMON_PORT", "8454"))
 VAULT_ROOT = Path("/Users/midas/Desktop/cowork/vault")
 EVENT_LOG_DIR = VAULT_ROOT / "subconscious"
 REALTIME_ENRICHER = Path("/Users/midas/Desktop/cowork/tools/realtime_enricher.py")

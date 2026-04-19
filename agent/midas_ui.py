@@ -48,6 +48,7 @@ from tool_executor import execute, set_memory, set_browser
 from synthesizer import synthesize
 from idle_queue import IdleQueue
 import research_tools
+from query_type_dispatch import dispatch as _query_type_dispatch
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -70,6 +71,8 @@ _session = {
 _feed = []  # last 20 memory events
 _last_subconscious = []  # memories injected on last turn
 _history = []  # conversation history
+_prev_memory_store_total = None  # M94: track store total for per-turn delta
+_all_user_queries = []  # M94: untrimmed list of all user queries for session summary
 
 # Main 25 Build 0: stable per-session briefing for prompt cache hit rate.
 # Built once at session start (or every N=5 turns), reused across turns so
@@ -280,8 +283,8 @@ def _write_session_summary():
 
     ts = time.strftime("%Y%m%d_%H%M%S")
 
-    # Full user message texts (not truncated) for signal extraction
-    user_texts = [m.get("content", "") for m in _history if m.get("role") == "user"]
+    # M94: use _all_user_queries (untrimmed) instead of extracting from _history
+    user_texts = list(_all_user_queries)
     # Truncated for persistence
     user_queries = [t[:200] for t in user_texts]
 
@@ -342,7 +345,7 @@ def _write_session_summary():
         "end_iso": time.strftime("%Y-%m-%dT%H:%M:%S",
                                  time.localtime(end_ts)),
         "duration_minutes": round(duration_s / 60.0, 1),
-        "duration_turns": len(_history),
+        "duration_turns": len(_all_user_queries),
         "user_queries": user_queries[-10:],
         "n_total_queries": len(user_queries),
         "last_topic": last_topic,
@@ -352,7 +355,7 @@ def _write_session_summary():
         "corrections": corrections[:10],
         "standing_rules": rules[:10],
         "last_subconscious": [
-            m.get("content", "")[:100] for m in _last_subconscious[:5]
+            m.get("text", "")[:100] for m in _last_subconscious[:5]
         ] if _last_subconscious else [],
     }
 
@@ -1476,11 +1479,13 @@ def _derive_message_roles(messages):
     return roles
 
 
-def _llm_call(messages, max_tokens, temperature, stop=None):
+def _llm_call(messages, max_tokens, temperature, stop=None,
+              repetition_penalty=1.0, min_p=0.0, top_p=0.0):
     body = {
         "model": MLX_MODEL, "messages": messages,
         "max_tokens": max_tokens, "temperature": temperature,
-        "repetition_penalty": 1.35,
+        "repetition_penalty": repetition_penalty,
+        "min_p": min_p, "top_p": top_p,
     }
     if stop:
         body["stop"] = stop
@@ -1521,13 +1526,15 @@ def llm_fn(messages, max_tokens=1500, temperature=0.7, stop=None, **_kw):
     return data["choices"][0]["message"]["content"] or ""
 
 
-def llm_stream(messages, max_tokens=600, temperature=0.7):
+def llm_stream(messages, max_tokens=600, temperature=0.7,
+               repetition_penalty=1.0, min_p=0.0, top_p=0.0):
     """Streaming LLM call — yields text chunks as they arrive."""
     global _last_stats
     _body = {
         "model": MLX_MODEL, "messages": messages,
         "max_tokens": max_tokens, "temperature": temperature,
-        "repetition_penalty": 1.35, "stream": True,
+        "repetition_penalty": repetition_penalty,
+        "min_p": min_p, "top_p": top_p, "stream": True,
     }
     # Main 55 L2b: attach per-message source-role tags (see _llm_call).
     _mr = _derive_message_roles(messages)
@@ -1703,7 +1710,7 @@ def index():
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
-    global _history, _last_subconscious, _session_briefing, _session_briefing_built_at_turn
+    global _history, _last_subconscious, _session_briefing, _session_briefing_built_at_turn, _all_user_queries
     data = request.get_json()
     message = (data or {}).get("message", "").strip()
     inject_context = (data or {}).get("inject_context", True)
@@ -1730,6 +1737,7 @@ def api_chat():
             if _is_recency_query(message):
                 recency_summary = load_last_session_summary()
                 recency_response = _build_recency_response(recency_summary)
+                _all_user_queries.append(message)
                 _history.append({"role": "user", "content": message})
                 _history.append({"role": "assistant", "content": recency_response})
                 _history = _trim_history(_history, MAX_HISTORY)
@@ -1986,6 +1994,7 @@ def api_chat():
                 response = "I don't have information about that right now."
 
             # 6. Update history
+            _all_user_queries.append(message)
             _history.append({"role": "user", "content": message})
             _history.append({"role": "assistant", "content": response})
             _history = _trim_history(_history, MAX_HISTORY)
@@ -2004,8 +2013,12 @@ def api_chat():
                                   .get("recall_filtered") or [])]
                 ai_result = memory.ingest("assistant", response,
                                           recall_context=_recall_texts or None)
-                if ai_result.get("extracted", 0) > 0:
-                    _session["facts_extracted"] += ai_result.get("extracted", 0)
+                _extracted_count = ai_result.get("extracted", 0)
+                _turn_record("extraction",
+                             count=int(_extracted_count),
+                             types=ai_result.get("types", []))
+                if _extracted_count > 0:
+                    _session["facts_extracted"] += _extracted_count
                     _add_feed("extraction", f"[midas] {response[:80]}")
                 # Main 45: log discarded ungrounded facts
                 if ai_result.get("discarded_ungrounded"):
@@ -2301,7 +2314,7 @@ def _emit_subconscious_event(ev_type: str, **details) -> None:
             "type": ev_type, "component": "midas_ui", "details": details
         }).encode()
         req = _ur.Request(
-            "http://127.0.0.1:8452/api/subconscious/emit",
+            "http://127.0.0.1:8454/api/subconscious/emit",
             data=body, headers={"Content-Type": "application/json"})
         _ur.urlopen(req, timeout=0.5).read()
     except Exception:
@@ -2530,7 +2543,7 @@ def api_research_queue_status(queue_id):
 @app.route("/api/chat/stream", methods=["POST"])
 def api_chat_stream():
     """Streaming chat — SSE response with tokens as they generate."""
-    global _history, _last_subconscious
+    global _history, _last_subconscious, _all_user_queries
     data = request.get_json()
     message = (data or {}).get("message", "").strip()
     inject_context = (data or {}).get("inject_context", True)
@@ -2575,6 +2588,7 @@ def api_chat_stream():
                 _pipeline_extraction_thread.start()
                 api_chat_stream._pending_response = None
                 _turn_record("extraction",
+                             fired=True,
                              pipeline_fired=True,
                              pipeline_target=f"turn_{_pending.get('turn', '?')}_assistant",
                              pipeline_start_ts=_pipeline_start_ts)
@@ -2613,6 +2627,7 @@ def api_chat_stream():
             if _is_recency_query(message):
                 recency_summary = load_last_session_summary()
                 recency_response = _build_recency_response(recency_summary)
+                _all_user_queries.append(message)
                 _history.append({"role": "user", "content": message})
                 _history.append({"role": "assistant", "content": recency_response})
                 _history = _trim_history(_history, MAX_HISTORY)
@@ -2658,6 +2673,35 @@ def api_chat_stream():
                 [tool_name] if tool_name and tool_name != "conversation" else [])
             if _missed:
                 _turn_record("routing", tools_requested_not_called=_missed)
+
+            # M73 Track B P1: static query-type dispatch.
+            # M74 Agent 2: retrieval_modifiers consumption controlled by
+            # env M74_A2_ACTIVE. =0 (default) → threshold=0.5 for all
+            # queries (current prod behavior). =1 → per-query-type dispatch.
+            _m73_dispatch = _query_type_dispatch(message)
+            _m74_retrieval_modifiers = _m73_dispatch["retrieval_modifiers"]
+            _m74_a2_active = (os.environ.get("M74_A2_ACTIVE", "0") == "1")
+            if _m74_a2_active:
+                _absence_sensitivity = _m74_retrieval_modifiers.get(
+                    "absence_gate_sensitivity", "normal")
+            else:
+                _absence_sensitivity = "normal"
+            _absence_threshold = {
+                "strict": 0.7, "normal": 0.5, "loose": 0.3
+            }.get(_absence_sensitivity, 0.5)
+            _turn_record(
+                "dispatch",
+                query_type=_m73_dispatch["query_type"],
+                sample_profile=_m73_dispatch["sample_profile"],
+                retrieval_modifiers=_m73_dispatch["retrieval_modifiers"],
+                retrieval_modifiers_applied={
+                    "m74_a2_active": _m74_a2_active,
+                    "absence_gate_sensitivity_effective": _absence_sensitivity,
+                    "absence_gate_threshold": _absence_threshold,
+                    "canonical_boost_active": False,  # M75 stub
+                    "scope_rerank_weight_active": False,  # M75 stub
+                },
+                source=_m73_dispatch["source"])
 
             # Phase 2: try enumeration first, then narrative, fall back to top-15 recall
             mem_ctx = None
@@ -2881,8 +2925,13 @@ def api_chat_stream():
             # recalled content uses different vocabulary than the query
             # (T03, T13 regression: 8 memories, scores up to 2.25,
             # but gate blocked because terms didn't word-match).
+            # M74 Agent 2: threshold now content-type-aware via dispatch
+            # retrieval_modifiers.absence_gate_sensitivity.
+            #   strict  → 0.7 (canonical_lookup, historical, decision)
+            #   normal  → 0.5 (current production default; code_gen, debugging, chit_chat)
+            #   loose   → 0.3 (synthesis, conceptual, brainstorm — tolerate weak recall)
             if (_guard_fired
-                    and _recall_score_max_for_log < 0.5
+                    and _recall_score_max_for_log < _absence_threshold
                     and (tool_name == "conversation" or not tool_name)):
                 _absence_response = (
                     "I don't have information about that in our research. "
@@ -2901,6 +2950,7 @@ def api_chat_stream():
                              skip_reason="absence_gate",
                              response_text=_absence_response,
                              response_chars=len(_absence_response))
+                _all_user_queries.append(message)
                 _history.append({"role": "user", "content": message})
                 _history.append({"role": "assistant", "content": _absence_response})
                 _history = _trim_history(_history, MAX_HISTORY)
@@ -3082,6 +3132,14 @@ def api_chat_stream():
                     _prefill_tokens_est += _rough_tokens(_m.get("content", "") or "")
             except Exception:
                 pass
+            _turn_record("assembled_prompt",
+                         messages=[{"role": _m.get("role", ""), "content": _m.get("content", "")} for _m in msgs],
+                         total_chars=sum(len(_m.get("content", "") or "") for _m in msgs),
+                         total_tokens_est=_prefill_tokens_est,
+                         role_structure=[_m.get("role", "") for _m in msgs],
+                         n_messages=len(msgs),
+                         mem_ctx_count=len(mem_ctx) if mem_ctx else 0,
+                         tool_result_chars=len(_tool_result_str) if _tool_result_str else 0)
 
             # Stream response — Main 40 P1: apply standing-rule
             # token cap if any active rule sets a quantitative
@@ -3112,7 +3170,18 @@ def api_chat_stream():
             _first_token_ts = None
             full_response = []
             _loop_window = ""  # Main 42: streaming loop detector
-            for chunk in llm_stream(msgs, max_tokens=_stream_max_tokens, temperature=0.3):
+            # M73 P1.5 Agent 3: plumb full sample_profile to llm_stream.
+            # Server now honors temperature + repetition_penalty + min_p + top_p.
+            _m73_sp = _m73_dispatch["sample_profile"]
+            _m73_temperature = float(_m73_sp["temperature"])
+            if mem_ctx and _m73_temperature > 0.3:
+                _m73_temperature = 0.3
+            _m73_rep_penalty = float(_m73_sp.get("repetition_penalty", 1.0))
+            _m73_min_p = float(_m73_sp.get("min_p", 0.0))
+            for chunk in llm_stream(msgs, max_tokens=_stream_max_tokens,
+                                    temperature=_m73_temperature,
+                                    repetition_penalty=_m73_rep_penalty,
+                                    min_p=_m73_min_p):
                 if _first_token_ts is None:
                     _first_token_ts = time.time()
                 full_response.append(chunk)
@@ -3237,6 +3306,13 @@ def api_chat_stream():
                 ngram_accepted=_ngram_accepted,
                 cpu_drafted=_stats.get("cpu_drafted", 0),
                 cpu_accepted=_stats.get("cpu_accepted", 0),
+                temperature_used=_m73_temperature,
+                repetition_penalty_used=_m73_rep_penalty,
+                min_p_used=_m73_min_p,
+                sampler_mode=("argmax" if _m73_temperature == 0.0 and _m73_rep_penalty == 1.0
+                              else "temperature_only" if _m73_rep_penalty == 1.0
+                              else "temp+rep_penalty"),
+                query_type=_m73_dispatch["query_type"],
                 drafts_per_accept_ngram=_drafts_per_accept,
                 model_size_gb_assumed=_model_gb,
                 dram_floor_gb_s=_dram_floor,
@@ -3248,6 +3324,7 @@ def api_chat_stream():
             )
 
             # Update history
+            _all_user_queries.append(message)
             _history.append({"role": "user", "content": message})
             _history.append({"role": "assistant", "content": response})
             _history = _trim_history(_history, MAX_HISTORY)
@@ -3325,13 +3402,22 @@ def api_chat_stream():
                              "routing", {}).get("tools_requested_not_called", []))
 
             # Post-turn: memory store total, turn complete.
+            # M89 fix: _ai_result doesn't exist in streaming path (NameError was
+            # silently swallowed). Use daemon stats for total; per-turn count is
+            # inherently lagged in streaming path (extraction is async ~80s).
             try:
+                global _prev_memory_store_total
                 _mstats = memory.stats() or {}
+                _cur_total = _mstats.get("total_memories") or 0
+                _stored_delta = max(0, _cur_total - (_prev_memory_store_total or _cur_total))
+                _prev_memory_store_total = _cur_total
                 _turn_record("post_turn",
-                             memory_store_total=_mstats.get("total_memories"),
-                             memories_stored_this_turn=int(_ai_result.get("extracted", 0)))
-            except Exception:
-                pass
+                             memory_store_total=_cur_total,
+                             memories_stored_this_turn=_stored_delta)
+            except Exception as _e:
+                _turn_record("post_turn", memory_store_total=None,
+                             memories_stored_this_turn=0,
+                             post_turn_error=str(_e)[:100])
 
             # Main 46: log scrub results
             if _scrub_result:
@@ -3360,6 +3446,42 @@ def api_chat_stream():
             yield f"data: {sse_data}\n\n"
 
     return app.response_class(generate_sse(), mimetype="text/event-stream")
+
+
+@app.route("/health/system")
+def api_health_system():
+    """M83 Priority 0 — exposes latest system_health probe reading.
+
+    Reads data/system_health/latest.json written by tools/system_health_probe.py
+    (launchd com.midas.system_health.probe, 5-min cadence + session-open
+    synchronous + pre-multi-agent + post-measurement). Returns 503 if probe
+    heartbeat is stale (>15 min) — indicates probe itself has failed.
+
+    Compressor-aware DRAM threshold per m83_rule1_amendment.
+    """
+    base = Path("/Users/midas/Desktop/cowork/data/system_health")
+    latest = base / "latest.json"
+    heartbeat = base / "probe_heartbeat"
+    if not latest.exists():
+        return jsonify({"error": "probe has not run yet",
+                        "expected_path": str(latest)}), 503
+    try:
+        snapshot = json.loads(latest.read_text())
+    except Exception as e:
+        return jsonify({"error": f"latest.json unreadable: {e}"}), 503
+    # Heartbeat staleness check
+    stale = False
+    if heartbeat.exists():
+        try:
+            hb_age = time.time() - heartbeat.stat().st_mtime
+            snapshot["_probe_heartbeat_age_sec"] = round(hb_age, 1)
+            stale = hb_age > 900  # 15 min
+        except Exception:
+            pass
+    if stale:
+        snapshot["_warning"] = "probe heartbeat >15 min stale; probe itself may have failed"
+        return jsonify(snapshot), 503
+    return jsonify(snapshot)
 
 
 @app.route("/api/subconscious/health")

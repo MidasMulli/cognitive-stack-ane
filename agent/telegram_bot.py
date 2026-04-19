@@ -76,7 +76,10 @@ def llm_fn(messages, max_tokens=500, temperature=0.3):
         data=data,
         headers={"Content-Type": "application/json"},
     )
-    resp = urllib.request.urlopen(req, timeout=90)
+    # Main 35 +2: bumped 90→600 per real-transcript prefill diagnosis
+    # (vault/research/findings/observed/m35-72b-real-transcript-wedge.md).
+    # Real chat content takes 2-7x longer to prefill than synthetic input.
+    resp = urllib.request.urlopen(req, timeout=600)
     r = json.loads(resp.read())
     return r["choices"][0]["message"].get("content", "") or ""
 

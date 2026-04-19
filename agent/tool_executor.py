@@ -9,6 +9,7 @@ Returns a plain-text result string ready to hand to the synthesizer.
 
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -36,6 +37,79 @@ def set_browser(bridge):
 
 # ── Vault (read-only) ───────────────────────────────────────────────────────
 
+def _useful_len(text: str) -> int:
+    """Main 55 P1a: measure 'useful' content length — strip YAML frontmatter
+    and whitespace-only lines before counting."""
+    if not text:
+        return 0
+    # Strip leading YAML frontmatter ( --- ... --- )
+    t = text.lstrip()
+    if t.startswith("---"):
+        end = t.find("\n---", 3)
+        if end != -1:
+            t = t[end + 4:]
+    # Collapse whitespace
+    t = "\n".join(line for line in t.splitlines() if line.strip())
+    return len(t.strip())
+
+
+# Main 55 P1d: scope qualifiers for dead-path queries. When a user asks
+# about dead paths AND names a subsystem, re-rank results post-retrieval
+# so the scope-matching rows float to the top. The CLAUDE.md dead-paths
+# table has rows scoped to each subsystem; naive keyword scoring returns
+# adjacent-but-wrong-scope rows (T2 failure: spec-decode dead paths when
+# the question asked for KV-cache dead paths).
+_DEADPATH_TRIGGERS = ("dead path", "dead paths", "killed path", "parked path")
+_DEADPATH_SCOPES = {
+    "kv cache":    ("kv cache", "kv-cache", "kvcache", "iosurface", "slc cache",
+                    "slc optimization", "cache-swap", "cache swap",
+                    "ctrl2", "cache hint"),
+    "spec decode": ("spec decode", "speculative", "drafter", "eagle",
+                    "n-gram", "ngram", "pard", "early exit", "self-spec"),
+    "ane":         ("ane ", "neural engine", "_anevirtual", "ane attention",
+                    "ane 1b", "ane slot", "ane standalone", "ane bandwidth",
+                    "espresso", "aned"),
+    "slc":         ("slc ", "cache hint", "ctrl2", "dcs ", "way mask"),
+    "hardware":    ("tb5", "dma", "mie", "emte", "n1 wireless", "amc ",
+                    "media engine", "amx", "gpu concurrent", "metal concurrent"),
+    "agent":       ("midas", "router", "layer1", "layer2", "layer3",
+                    "tool executor", "playbook"),
+    "retrieval":   ("recall", "retrieval", "embedding", "chromadb",
+                    "localmemorystore", "memory store"),
+}
+
+
+def _scope_rerank(matches: list, query: str) -> list:
+    """Main 55 P1d: if query is a scope-qualified dead-path question,
+    re-rank matches so snippets mentioning the scope's marker terms
+    dominate. Non-destructive: if no scope markers match anywhere,
+    returns matches unchanged.
+    """
+    q_low = query.lower()
+    if not any(t in q_low for t in _DEADPATH_TRIGGERS):
+        return matches
+    scope_terms: tuple = ()
+    for scope_key, terms in _DEADPATH_SCOPES.items():
+        if scope_key in q_low:
+            scope_terms = terms
+            break
+    if not scope_terms:
+        return matches
+    rescored = []
+    for m in matches:
+        bonus = 0
+        for s in m.get("snippets", []):
+            s_low = s.lower()
+            for term in scope_terms:
+                if term in s_low:
+                    bonus += 3
+        m = dict(m)  # shallow copy — don't mutate caller's dict
+        m["_score"] = m.get("_score", 0) + bonus
+        rescored.append(m)
+    rescored.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    return rescored
+
+
 def _vault_read(path: str = "", query: str = "") -> dict:
     """Read vault content. Prefers snippet-based search over full-file dumps.
 
@@ -46,10 +120,138 @@ def _vault_read(path: str = "", query: str = "") -> dict:
     """
     import glob as globmod
 
+    # Main 46: targeted file search. When both path and query are
+    # provided, search within the specific file for the query terms.
+    # Used by session-indexed retrieval to search session_milestones.md.
+    if query and path:
+        target = os.path.join(VAULT_PATH, path)
+        if os.path.isfile(target):
+            with open(target, "r") as f:
+                content = f.read()
+            # Find the section matching the query. Support OR-expanded
+            # multi-session queries from _session_query_args P1b: split
+            # on " OR " and match if ANY term appears in the section.
+            sections = content.split("\n## ")
+            query_lower = query.lower()
+            or_terms = [t.strip() for t in query_lower.split(" or ")
+                        if t.strip()]
+            if not or_terms:
+                or_terms = [query_lower]
+            matched_sections = []
+            for sec in sections:
+                sec_low = sec.lower()
+                if any(t in sec_low for t in or_terms):
+                    matched_sections.append("## " + sec if not sec.startswith("#") else sec)
+            if matched_sections:
+                result_text = "\n\n".join(s.strip() for s in matched_sections)
+                first_result = {"query": query, "file": path,
+                                "matches": [{"file": path, "snippets": [result_text[:3000]]}]}
+                # Main 55 P1a: widen-on-sparse fallback. If the targeted
+                # file read returned thin content, ALSO fire a broad
+                # vault_search and merge the broader hits. "Thin" = <500
+                # useful chars (frontmatter + whitespace stripped).
+                widen_on_sparse = _useful_len(result_text) < 500
+                # Main 57 P3: widen-on-topic-qualifier. Even when the
+                # section match is substantive (≥500 chars), if the
+                # query contains topic terms beyond the session anchor
+                # (e.g., "Main 54 mechanism audit findings" — audit
+                # detail lives in agent_reports/, not session_milestones
+                # summary), also fire a cross-dir search. Trigger fires
+                # only when path is the session_milestones default from
+                # router._session_query_args so user-supplied path reads
+                # still return exact content without noise.
+                widen_on_topic = False
+                if (path == "knowledge/session_milestones.md"
+                        and not widen_on_sparse):
+                    # Strip the session anchor and stopwords, count
+                    # remaining content words. 2+ means the user is
+                    # asking for specific detail, not a summary.
+                    _anchor_re = re.compile(
+                        r'\b(?:main|session|m)\s*\d{1,3}\b',
+                        re.IGNORECASE)
+                    _topic_stop = {
+                        'the', 'a', 'an', 'of', 'in', 'on', 'at', 'to',
+                        'for', 'from', 'with', 'by', 'is', 'are', 'was',
+                        'were', 'be', 'been', 'have', 'has', 'had', 'do',
+                        'does', 'did', 'what', 'which', 'who', 'how',
+                        'why', 'when', 'where', 'that', 'this', 'it',
+                        'its', 'we', 'our', 'they', 'them', 'you',
+                        'your', 'my', 'say', 'said', 'says', 'tell',
+                        'show', 'list', 'about', 'any', 'some', 'all',
+                        'and', 'or', 'but', 'so', 'not', 'no', 'yes',
+                        'just', 'only', 'also',
+                    }
+                    _q_stripped = _anchor_re.sub(" ", query.lower())
+                    _topic_words = [
+                        w for w in re.findall(r'\w+', _q_stripped)
+                        if w not in _topic_stop and not w.isdigit()
+                        and len(w) > 2
+                    ]
+                    widen_on_topic = len(_topic_words) >= 2
+                if widen_on_sparse or widen_on_topic:
+                    reason = ("sparse" if widen_on_sparse
+                              else f"topic-qualifier ({len(_topic_words)} terms)")
+                    print(f"[vault_read] {reason} path+query hit "
+                          f"({_useful_len(result_text)} chars) on {path}, "
+                          f"widening to cross-dir search", flush=True)
+                    broader = _vault_read(path="", query=query)
+                    broader_matches = broader.get("matches", [])
+                    if broader_matches:
+                        seen = {path}
+                        merged = first_result["matches"][:]
+                        for bm in broader_matches:
+                            if bm.get("file") not in seen:
+                                merged.append(bm)
+                                seen.add(bm.get("file"))
+                        first_result["matches"] = merged[:8]
+                        first_result["_widened"] = True
+                        first_result["_widen_reason"] = reason
+                        print(f"[vault_read] widen hit: +{len(merged) - 1} files "
+                              f"from cross-dir search", flush=True)
+                return first_result
+            # Main 55 P1c: path+query gave ZERO matches — fall back to
+            # cross-directory search rather than abstaining. T5 failure
+            # mode: path='knowledge/session_milestones.md' but the answer
+            # lived in agent_reports/.
+            print(f"[vault_read] no section match for '{query}' in {path}; "
+                  f"falling back to cross-dir vault_search", flush=True)
+            fallback = _vault_read(path="", query=query)
+            fallback_matches = fallback.get("matches", [])
+            if fallback_matches:
+                print(f"[vault_read] fallback hit: {len(fallback_matches)} files "
+                      f"from cross-dir search", flush=True)
+                return {"query": query, "file": path,
+                        "matches": fallback_matches,
+                        "_widened_from_path_miss": True,
+                        "note": f"path '{path}' had no match; widened to cross-dir"}
+            return {"query": query, "file": path, "matches": [],
+                    "note": f"No section matching '{query}' in {path}"}
+
     if query:
-        # Multi-file snippet search — extract matching lines with context
+        # Multi-file keyword search with stopword filtering and
+        # knowledge/ directory boost. Main 40 fix: the old code
+        # dropped numbers ≤2 chars ("38" from "main 38") and ranked
+        # by snippet count rather than keyword coverage, causing
+        # session-identifier queries to match the wrong session.
+        _STOP = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at',
+            'to', 'for', 'of', 'with', 'by', 'from', 'is', 'are',
+            'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do',
+            'does', 'did', 'will', 'would', 'could', 'should', 'not',
+            'so', 'if', 'than', 'that', 'this', 'it', 'its', 'we',
+            'our', 'they', 'them', 'what', 'which', 'who', 'how',
+            'why', 'when', 'where', 'all', 'each', 'every', 'some',
+            'too', 'very', 'just', 'about', 'also', 'any', 'up',
+            'out', 'off', 'list', 'explain', 'describe', 'tell',
+            'show', 'give', 'me', 'us', 'you', 'your', 'my',
+        }
+        # Keep numbers (even short ones like "38") and meaningful words
+        query_words = [w.lower() for w in query.split()
+                       if w.lower() not in _STOP and len(w) > 0]
+        if not query_words:
+            query_words = [w.lower() for w in query.split()[:4]]
+
         matches = []
-        query_words = [w.lower() for w in query.split() if len(w) > 2]
         for md_file in globmod.glob(os.path.join(VAULT_PATH, "**/*.md"), recursive=True):
             rel = os.path.relpath(md_file, VAULT_PATH)
             if rel.startswith("memory/") or rel.startswith("subconscious/"):
@@ -58,9 +260,32 @@ def _vault_read(path: str = "", query: str = "") -> dict:
                 with open(md_file, "r") as f:
                     content = f.read()
                 content_lower = content.lower()
-                # Match if any query word appears
-                if not any(w in content_lower for w in query_words):
+                # Score by keyword coverage
+                hits = sum(1 for w in query_words if w in content_lower)
+                if hits == 0:
                     continue
+                # Boost knowledge/ files (curated authoritative), deprioritize
+                # research/ files (exploratory, often tangential). Main 41:
+                # Ray-Ban research files were outranking ANE canonical data.
+                if rel.startswith("knowledge/"):
+                    score = hits + 3
+                elif rel.startswith("research/"):
+                    score = hits - 1
+                else:
+                    score = hits
+                # Main 57 P3: filename-match boost. When query words appear
+                # in the file's basename, the file's topic is explicitly
+                # about that anchor. Without this, `agent_reports/main54_
+                # phase1_mechanism_inventory.md` scores only 2 (hits alone)
+                # while `knowledge/enricher_architecture.md` scores 5 (1 hit +
+                # 3 knowledge boost) despite being off-topic. Results
+                # observed in M57 live validation T15/T17 where M54 audit
+                # content was ranked out of the top-8 by tangential
+                # knowledge/ files. +5 per word match in basename.
+                _fn_base = os.path.basename(rel).lower().replace("_", " ").replace("-", " ")
+                fn_hits = sum(1 for w in query_words if len(w) > 1 and w in _fn_base)
+                if fn_hits:
+                    score += fn_hits * 5
                 lines = content.split("\n")
                 snippets = []
                 for i, line in enumerate(lines):
@@ -72,11 +297,17 @@ def _vault_read(path: str = "", query: str = "") -> dict:
                         if len(snippet) > 20:
                             snippets.append(snippet)
                 if snippets:
-                    matches.append({"file": rel, "snippets": snippets[:5]})
+                    matches.append({
+                        "file": rel,
+                        "snippets": snippets[:5],
+                        "_score": score,
+                    })
             except Exception:
                 continue
-        # Sort by number of snippets (most relevant first)
-        matches.sort(key=lambda m: len(m["snippets"]), reverse=True)
+        # Sort by score (keyword coverage + knowledge boost)
+        matches.sort(key=lambda m: m.get("_score", 0), reverse=True)
+        # Main 55 P1d: scope-qualified dead-path rerank.
+        matches = _scope_rerank(matches, query)
         # Cap total output to ~3000 chars
         result_matches = []
         total_len = 0
@@ -109,6 +340,18 @@ def _vault_read(path: str = "", query: str = "") -> dict:
         files = [f for f in sorted(os.listdir(full_path)) if f.endswith(".md")]
         return {"directory": path, "files": files}
     if not os.path.exists(full_path):
+        # Main 55 P1c: file-not-found → fall back to cross-dir search using
+        # the path stem as a query. Derive keywords from the path basename.
+        stem = os.path.splitext(os.path.basename(path))[0]
+        fallback_q = stem.replace("_", " ").replace("-", " ")
+        if fallback_q:
+            print(f"[vault_read] file not found: {path}; falling back to "
+                  f"vault_search(query='{fallback_q}')", flush=True)
+            fallback = _vault_read(path="", query=fallback_q)
+            if fallback.get("matches"):
+                return {"query": fallback_q, "requested_path": path,
+                        "matches": fallback["matches"],
+                        "_widened_from_missing_file": True}
         return {"error": f"File not found: {path}"}
     try:
         with open(full_path, "r") as f:
@@ -148,6 +391,13 @@ def _vault_research(query: str) -> dict:
     Unlike vault_read which searches summaries, this searches the detailed
     research files where specific findings, measurements, and opcodes live.
     Larger output budget (6000 chars) for technical depth.
+
+    M54 Phase 2.3: when the query is possessive intent ("our X", "we have"),
+    downweight files in research/ subdirectory by 0.1x. The research/ folder
+    is overwhelmingly external project notes (Orion, Meta Ray-Ban, etc.),
+    not internal capabilities. Without this filter, vault_research returns
+    Orion-heavy content for "our LoRA pipeline" queries and the model
+    attributes external research as our capability.
     """
     import glob as globmod
 
@@ -157,6 +407,28 @@ def _vault_research(query: str) -> dict:
     query_words = [w.lower() for w in query.split() if len(w) > 2]
     if not query_words:
         return {"error": "query too short"}
+
+    # M54 Phase 2.4: possessive-intent detection. Distinguish CAPABILITY
+    # questions ("do we have X", "is X our pipeline") from KNOWLEDGE
+    # questions ("what do we know about X", "have we researched X").
+    # Knowledge questions SHOULD surface external research notes — that's
+    # exactly what they're asking for. Capability questions should NOT.
+    q_low = query.lower()
+    capability_markers = [
+        "our ", "we have", "we've", "do we have", "do we use",
+        "did we build", "did we ship", "did we deploy", "are we using",
+        "are we running", "have we built", "have we deployed",
+    ]
+    knowledge_markers = [
+        "do we know", "what do we know", "have we researched",
+        "have we explored", "have we investigated", "have we read",
+        "what have we found", "have we documented", "have we studied",
+    ]
+    has_capability = any(m in q_low for m in capability_markers)
+    has_knowledge = any(m in q_low for m in knowledge_markers)
+    # Knowledge intent dominates: if user asks "what do we know about X",
+    # don't downweight external research even if "our" appears.
+    possessive = has_capability and not has_knowledge
 
     # Search deep research directories that vault_read skips
     search_dirs = [
@@ -201,6 +473,44 @@ def _vault_research(query: str) -> dict:
                     # Boost files whose names match query words
                     fname_lower = os.path.basename(md_file).lower()
                     score += sum(5 for w in query_words if w in fname_lower)
+                    # M54 Phase 2.4: possessive-intent filter, tightened.
+                    # Match recall-layer's 0.05x. Detect external-project
+                    # content beyond research/ folder via content markers
+                    # (arXiv IDs, third-party project names, explicit
+                    # "external" / "prior art" labels). Catches files like
+                    # agent_reports/ane_frontier_deep_dive.md that are
+                    # internal write-ups OF external research — these
+                    # were the Q06 leak source.
+                    if possessive:
+                        rel_norm = rel.replace("\\", "/")
+                        is_external = False
+                        # Filename / path heuristics. relpath has no
+                        # leading slash, so check both startswith and
+                        # mid-path for nested cases.
+                        if (rel_norm.startswith("research/")
+                                or "/research/" in rel_norm):
+                            is_external = True
+                        elif any(t in fname_lower for t in (
+                                "frontier", "prior_art", "prior-art",
+                                "deep_dive", "deep-dive", "external_",
+                                "third_party", "competitor")):
+                            is_external = True
+                        else:
+                            # Content heuristics: snippet-level external
+                            # markers. arXiv IDs, "Murai Labs", "third-party",
+                            # "external project", "prior art" all signal that
+                            # the discussed system is NOT ours.
+                            joined = " ".join(snippets[:3]).lower()
+                            ext_signals = sum(1 for sig in (
+                                "arxiv:", "arxiv ", "murai labs",
+                                "third-party", "third party", "external project",
+                                "prior art", "competing", "rival project",
+                                "(external)", "(third-party)") if sig in joined)
+                            # Two or more signals → external
+                            if ext_signals >= 2:
+                                is_external = True
+                        if is_external:
+                            score = score * 0.05
                     matches.append({"file": rel, "snippets": snippets[:8], "score": score})
             except Exception:
                 continue
@@ -672,6 +982,17 @@ def execute(tool_name: str, args: dict) -> str:
 
 def _dispatch(name: str, args: dict) -> dict:
     """Route tool name to handler. Returns dict."""
+    # Main 46: normalize truncated tool names from L2 LLM routing.
+    # The 27B occasionally returns "vault" instead of "vault_read",
+    # "memory" instead of "memory_recall", etc.
+    _TOOL_ALIASES = {
+        "vault": "vault_read",
+        "memory": "memory_recall",
+        "browse": "browse_search",
+        "research": "vault_research",
+    }
+    name = _TOOL_ALIASES.get(name, name)
+
     # Memory
     if name == "memory_ingest":
         if not _memory or not _memory._started:
@@ -698,9 +1019,19 @@ def _dispatch(name: str, args: dict) -> dict:
     if name == "vault_insight":
         return _vault_insight(args.get("topic", ""))
 
-    # Browser
+    # Browser — auto-launch Chrome headless if not already connected
     if name.startswith("browse_") and not _browser:
-        return {"error": "Browser not available. Chrome CDP is only accessible from the local terminal, not Telegram."}
+        try:
+            from browser import BrowserBridge
+            _b = BrowserBridge()
+            if _b.is_available():  # triggers auto-launch if Chrome not running
+                _b.connect()
+                set_browser(_b)
+                print("[tool_executor] browser auto-connected on demand", flush=True)
+        except Exception as _be:
+            print(f"[tool_executor] browser auto-connect failed: {_be}", flush=True)
+    if name.startswith("browse_") and not _browser:
+        return {"error": "Browser not available. Chrome could not be launched."}
     if name == "browse_navigate":
         return _browser.navigate(args.get("url", ""), args.get("wait", 2))
     if name == "browse_read":
@@ -714,7 +1045,38 @@ def _dispatch(name: str, args: dict) -> dict:
     if name == "browse_search":
         return _browser.search(args.get("query", ""), args.get("max_results", 5))
     if name == "browse_x_feed":
-        return _browser.scan_x_feed(args.get("count", 5))
+        # Main 62 pilot-fix 4: multi-handle ("difference between @X and @Y")
+        # support. If router emits a `handles` list of 2+, fetch each and
+        # merge. Back-compat: if `handles` absent, fall through to the
+        # original single-handle call.
+        handles = args.get("handles")
+        if isinstance(handles, list) and len(handles) >= 2:
+            merged_posts = []
+            fetched = []
+            errors = []
+            for h in handles:
+                try:
+                    r = _browser.scan_x_feed(args.get("count", 5), h)
+                    fetched.append(h)
+                    if isinstance(r, dict) and r.get("posts"):
+                        for p in r["posts"]:
+                            # Tag each post with its source handle so
+                            # the synthesizer can differentiate.
+                            if isinstance(p, dict) and "handle" not in p:
+                                p = {**p, "handle": h}
+                            merged_posts.append(p)
+                    elif isinstance(r, dict):
+                        # Preserve any non-posts fields (errors, meta) per-handle
+                        errors.append({"handle": h, "result": r})
+                except Exception as e:
+                    errors.append({"handle": h, "error": str(e)})
+            return {
+                "posts": merged_posts,
+                "handles_fetched": fetched,
+                "multi_handle": True,
+                "per_handle_errors": errors,
+            }
+        return _browser.scan_x_feed(args.get("count", 5), args.get("handle"))
     if name == "browse_tabs":
         return {"tabs": _browser.get_tabs()}
 
