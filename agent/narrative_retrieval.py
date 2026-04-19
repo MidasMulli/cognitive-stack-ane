@@ -23,6 +23,16 @@ if _TOOLS_DIR not in sys.path:
 _MIN_RECORDS = 3
 _MIN_SESSIONS = 2
 _MAX_RECORDS = 30
+
+# M97 Fix 1 (narrative-shape over-firing gate). Calibrated against the M92
+# 27-turn baseline: arc/factual-thread paths fired on 5 of 27 turns today
+# (T05/T06/T07/T12/T13 after existing topical gate). Target ≤3.
+# Gate at (top-record score >= 2.3 AND query-match-ratio >= 0.60) cuts T06
+# and T12 to land at T05/T07/T13 — 3 of 27.
+# Deadpath and registry paths are separate shapes with their own quality
+# logic; this gate applies only to arc + factual-thread.
+_M97_MIN_TOP_SCORE = 2.3
+_M97_MIN_QUERY_MATCH_RATIO = 0.60
 _CORPUS_DIR = str(Path(__file__).resolve().parent.parent.parent / "data" / "corpus_b_extractions")
 
 # ── Intent classification (keyword v1) ──────────────────────────────────
@@ -359,11 +369,23 @@ def try_narrative_context(query: str, corpus_dir: str = None,
         stop_words = {"what", "does", "that", "this", "with", "from", "have", "been",
                       "about", "which", "where", "when", "many", "much", "happened"}
         query_specific = query_words - stop_words
+        query_match_ratio = 1.0
         if query_specific:
             thread_text = " ".join(r.get("content", "") for r in thread).lower()
             unmatched = [w for w in query_specific if w not in thread_text]
             if len(unmatched) > len(query_specific) * 0.5 and len(query_specific) >= 2:
                 return None  # topically irrelevant thread, let guard handle
+            query_match_ratio = (len(query_specific) - len(unmatched)) / len(query_specific)
+
+        # M97 Fix 1 — content-match gate. The top thread record's score
+        # (entity-overlap + word-match boost) and the query-match ratio
+        # together express how much of the query the narrative thread
+        # actually addresses. Below threshold: thread is too weakly tied
+        # to the query, fall through to default_recall. Calibrated on the
+        # M92 baseline — see header comment.
+        top_score = thread[0].get("score", 0) if thread else 0
+        if top_score < _M97_MIN_TOP_SCORE or query_match_ratio < _M97_MIN_QUERY_MATCH_RATIO:
+            return None
 
         if intent == "arc":
             arc = _arc_tracer(thread)
