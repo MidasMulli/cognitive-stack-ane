@@ -11,7 +11,7 @@ Zero cloud. Sub-millisecond memory recall. The agent that uses this stack is **M
 | Tier | Model | Hardware | Role | Speed |
 |---|---|---|---|---|
 | **Verifier** | Gemma 4 31B Q4 | GPU (MLX-Metal, 20 cores) | conversation + reasoning | 17.5 tok/s pure AR |
-| **Extractor** | Llama 3.1-8B-Instruct Q8 | ANE (CoreML, 72 dispatches) | typed fact extraction | 7.9 tok/s |
+| **Extractor** | Llama 3.1-8B-Instruct Q8 | ANE (CoreML, 72 dispatches) | typed fact extraction | 9.66 tok/s |
 | **Embedder** | MiniLM-L6-v2 | ANE (CoreML, CPU_AND_NE) | retrieval embedding | 0.84 ms/embed |
 | **Classifier** | Neuron 80M (FFN-only) | ANE SRAM | domain routing | 905 μs |
 | **Drafter** | N-gram (truncate-on-miss) | software | speculative decode | disabled (phrase loops) |
@@ -81,7 +81,7 @@ The architecture and measurements behind this stack are documented across two pa
 ## Related repos
 
 - [subconscious](https://github.com/MidasMulli/subconscious) — the cognitive memory loops, separate package
-- [ane-compiler](https://github.com/MidasMulli/ane-compiler) — model builder + fusion optimizer + dispatch orchestrator (GPT-2 229 tok/s, Llama-1B 50.2 tok/s, Llama-8B Q8 7.9 tok/s, Neuron 1,064 tok/s)
+- [ane-compiler](https://github.com/MidasMulli/ane-compiler) — model builder + fusion optimizer + dispatch orchestrator (GPT-2 229 tok/s, Llama-1B 50.2 tok/s, Llama-8B Q8 9.66 tok/s, Neuron 1,064 tok/s)
 - [ane-dispatch](https://github.com/MidasMulli/ane-dispatch) — direct ANE dispatch + SharedEvents (37% faster than CoreML)
 - [ane-toolkit](https://github.com/MidasMulli/ane-toolkit) — IOKit protocol decoder + Mach-O .hwx tooling
 - [four-path-mlx](https://github.com/MidasMulli/four-path-mlx) — multi-source speculative decoding server — the inference-level results that the NAX hardware data explains
