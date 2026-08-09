@@ -49,6 +49,65 @@ from synthesizer import synthesize
 from idle_queue import IdleQueue
 import research_tools
 from query_type_dispatch import dispatch as _query_type_dispatch
+# m125_a2_shape_precedence — canonical-lookup classifier for narrative
+# suppression. See shape_precedence.py module docstring for the authoritative
+# spec. K6-safe: negative patterns gate FIRST, then M122 A4 reuse, then
+# A2-local positives. Under-fit by design.
+from shape_precedence import (
+    is_canonical_lookup as _m125_a2_is_canonical_lookup,
+    DISPATCH_DECISION_NARRATIVE_PRIMARY as _M125_A2_DD_NARRATIVE,
+    DISPATCH_DECISION_RECALL_PRIMARY_CANONICAL_LOOKUP as _M125_A2_DD_RECALL_PRIMARY,
+    DISPATCH_DECISION_NARRATIVE_SUPPRESSED_CLASSIFIER as _M125_A2_DD_NARRATIVE_SUPPRESSED,
+    DISPATCH_DECISION_OTHER as _M125_A2_DD_OTHER,
+)
+
+# m118_e_sub_shape_2 — anaphor resolution at retrieval layer. Stream D
+# shipped anaphor_resolver.resolve_antecedent; wire it into the two recall
+# sites so demonstrative follow-ups ("what was the purpose of this
+# classifier?", "is that all?") carry the antecedent phrase into the
+# embedding query. Without this the bare demonstrative embeds to ~0 cosine
+# against every stored memory and absence gate fires (M117 T9/T18).
+try:
+    from anaphor_resolver import resolve_antecedent as _anaphor_resolve_antecedent
+except Exception:
+    _anaphor_resolve_antecedent = None
+
+
+def _m118_e_expand_query_with_antecedent(message: str, history: list) -> str:
+    """Return a query string with the resolved antecedent prepended when
+    a demonstrative / 3p pronoun is present and the prior assistant turn
+    yields a confident referent. Falls back to the original message when
+    no resolver, no prior turn, or no match. Never shortens the query —
+    only additive.
+
+    Called by both recall call-sites (/api/chat and streaming). Keeps the
+    extension inside the retrieval layer so downstream scrub/grounding
+    logic sees the resolved text and not just "this".
+    """
+    if _anaphor_resolve_antecedent is None or not message:
+        return message
+    prior_assistant = ""
+    for _h in reversed(history or []):
+        if _h.get("role") == "assistant":
+            prior_assistant = _h.get("content", "") or ""
+            break
+    if not prior_assistant:
+        return message
+    try:
+        res = _anaphor_resolve_antecedent(message, prior_assistant)
+    except Exception:
+        return message
+    ant = res.get("antecedent_entity")
+    conf = res.get("confidence")
+    if not ant or conf == "none":
+        return message
+    # Accept both "high" and "medium" — the retrieval embedding is robust
+    # to an extra phrase; the cost of a false antecedent is a slightly
+    # softer cosine, the cost of missing a true antecedent is 0.0 recall
+    # and an unnecessary absence-gate fire.
+    if ant.lower() in message.lower():
+        return message
+    return f"{message} {ant}"
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -73,6 +132,13 @@ _last_subconscious = []  # memories injected on last turn
 _history = []  # conversation history
 _prev_memory_store_total = None  # M94: track store total for per-turn delta
 _all_user_queries = []  # M94: untrimmed list of all user queries for session summary
+# M125 A5.1: prior-turn tool stash for anaphoric fold-in across tools.
+# Updated after each chat turn with the tool_name that was actually
+# dispatched. Used by router.route()/layer1_route() on the next turn
+# to re-fire time-sensitive tools (browse_x_feed, browse_search) on
+# subject-continuity follow-ups and to fold prior subject into
+# memory_recall/vault_read/vault_research on anaphoric follow-ups.
+_last_tool = ""
 
 # Main 25 Build 0: stable per-session briefing for prompt cache hit rate.
 # Built once at session start (or every N=5 turns), reused across turns so
@@ -409,6 +475,95 @@ def load_last_session_summary():
 
     Public (no leading underscore) so router.recency routing can reuse it.
     """
+    return load_nth_session_summary(1)
+
+
+# M125.1 Stream B — recency-ordinal N-back handler.
+# Pilot T22/T23/T24 (sess_20260422_203807_1385) showed the recency
+# short-circuit returning the latest session summary for every query,
+# ignoring ordinal N-back references: "three sessions ago", "two
+# sessions before last", "10 sessions ago". Sorted session summaries
+# already exist on disk (~/Desktop/cowork/data/session_summaries/),
+# indexed by mtime-desc — "N sessions ago" == candidates[N-1]. Fix
+# shape is detection + index, not new storage. Under-fit scope:
+# "sessions ago"-only; "turns ago" (within-session ordinal) is a
+# different data store (conversation history) and is deferred.
+_ORDINAL_WORD_MAP = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+# Match: "N sessions ago", "N sessions back", "N sessions before last".
+# N may be digits (1-99) OR a spelled word from _ORDINAL_WORD_MAP.
+_RECENCY_ORDINAL_NBACK_RE = re.compile(
+    r"\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)"
+    r"\s+sessions?\s+(?:ago|back|before\s+last)\b",
+    re.IGNORECASE,
+)
+
+# M125.2 Stream D — turn-scope ordinal N-back.
+# Within-session turn references: "N turns ago", "N turns back",
+# "N messages ago", "N messages back", "N exchanges ago",
+# "N exchanges back". Under-fit discipline: require an explicit
+# ordinal marker (digit or spelled 1-10) AND one of the turn-level
+# scope nouns. "earlier in session" / "before that" / "previous
+# response" are deliberately NOT matched here — M125.1 B K15
+# ambiguous-form deferral to M125.3. A5.1 anaphoric resolver
+# continues to own subject-continuity follow-ups that may
+# incidentally mention "turns" without an ordinal marker.
+_TURN_ORDINAL_NBACK_RE = re.compile(
+    r"\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)"
+    r"\s+(?:turns?|messages?|exchanges?)\s+(?:ago|back|before\s+last)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_ordinal_nback(text: str):
+    """Classify ordinal N-back references into (N, scope).
+
+    Returns:
+      - (N, 'turn') for "N turns ago" / "N messages back" /
+        "N exchanges ago" (within-session, M125.2 Stream D).
+      - (N, 'session') for "N sessions ago" / "N sessions back" /
+        "N sessions before last" (cross-session, M125.1 Stream B).
+      - None when no ordinal marker is present.
+
+    Turn-scope is checked FIRST so a query carrying both "turns" and
+    "sessions" (which should be rare; under-fit discipline) routes to
+    the more specific within-session accessor. Scope is an explicit
+    return value so dispatch sites route to the correct loader.
+    """
+    if not text:
+        return None
+    # M125.2 Stream D: turn-scope first. Under-fit: explicit ordinal
+    # marker required so anaphoric queries that mention "turns" without
+    # a count (e.g. "across several turns") stay with A5.1.
+    m_turn = _TURN_ORDINAL_NBACK_RE.search(text)
+    if m_turn:
+        raw = m_turn.group(1).lower()
+        if raw.isdigit():
+            n = int(raw)
+        else:
+            n = _ORDINAL_WORD_MAP.get(raw, 0)
+        if n >= 1:
+            return (n, "turn")
+    m_sess = _RECENCY_ORDINAL_NBACK_RE.search(text)
+    if m_sess:
+        raw = m_sess.group(1).lower()
+        if raw.isdigit():
+            n = int(raw)
+        else:
+            n = _ORDINAL_WORD_MAP.get(raw, 0)
+        if n >= 1:
+            return (n, "session")
+    return None
+
+
+def load_nth_session_summary(n: int = 1):
+    """Return the Nth-most-recent session summary (1 = latest, 2 =
+    previous, etc.), or None if N exceeds available history. Shared
+    impl for load_last_session_summary (N=1) and M125.1 ordinal
+    N-back handler.
+    """
     try:
         if not os.path.isdir(_SESSION_SUMMARIES_DIR):
             return None
@@ -417,15 +572,95 @@ def load_last_session_summary():
             for f in os.listdir(_SESSION_SUMMARIES_DIR)
             if f.startswith("session_") and f.endswith(".json")
         ]
-        if not candidates:
+        if not candidates or n < 1 or n > len(candidates):
             return None
         candidates.sort(key=os.path.getmtime, reverse=True)
-        with open(candidates[0]) as f:
+        with open(candidates[n - 1]) as f:
             summary = json.load(f)
-        summary["_path"] = candidates[0]
+        summary["_path"] = candidates[n - 1]
+        summary["_nback"] = n
+        summary["_total_available"] = len(candidates)
         return summary
     except Exception as e:
-        print(f"[session] load_last_session_summary failed: {e}", flush=True)
+        print(f"[session] load_nth_session_summary({n}) failed: {e}",
+              flush=True)
+        return None
+
+
+def load_nth_turn(n: int, session_log_dir: str = None):
+    """Return the Nth-most-recent COMPLETED turn record from the current
+    session's on-disk turn log, or None if N exceeds available history.
+
+    Canonical store:
+      data/session_logs/{session_id}/turn_NNNN.json
+
+    Indexing convention (M125.2 Stream D):
+      N=1 → the most recent completed turn (written to disk before the
+            current in-flight turn began).
+      N=2 → two turns ago.
+      Etc.
+
+    The in-flight turn itself is excluded: _current_turn has not been
+    written to disk yet at short-circuit time, and "0 turns ago" is not
+    a useful query boundary.
+
+    Returns a dict shaped for _build_recency_response to render. Keys
+    (all optional; callers handle None gracefully):
+      _nback           : int — the N that was requested
+      _total_available : int — count of on-disk turn JSONs
+      _path            : str — absolute path of the turn JSON loaded
+      turn_number      : int — 1-based turn index within session
+      user_query       : str — the user message at that turn
+      assistant_response : str — the response the system returned
+      tools_called     : list — L0/L1/L2 tools dispatched for that turn
+      route_layer      : str — L0/L1/L2
+      shape_fired      : str — retrieval shape fired, if any
+      recall_filtered  : list — recall_filtered snapshot, if any
+    """
+    try:
+        if session_log_dir is None:
+            session_log_dir = _SESSION_LOG_DIR
+        if not session_log_dir or not os.path.isdir(session_log_dir):
+            return None
+        candidates = [
+            os.path.join(session_log_dir, f)
+            for f in os.listdir(session_log_dir)
+            if f.startswith("turn_") and f.endswith(".json")
+        ]
+        if not candidates or n < 1 or n > len(candidates):
+            return None
+        # Sort by the 4-digit turn number in the filename so we get
+        # a deterministic order independent of mtime races. N=1 is
+        # the HIGHEST turn number on disk (most recent completed).
+        def _turn_num(path):
+            try:
+                return int(os.path.basename(path)[5:9])
+            except Exception:
+                return -1
+        candidates.sort(key=_turn_num, reverse=True)
+        chosen = candidates[n - 1]
+        with open(chosen) as f:
+            raw = json.load(f)
+        record = {
+            "_nback": n,
+            "_total_available": len(candidates),
+            "_path": chosen,
+            "turn_number": raw.get("turn_number"),
+            "user_query": (raw.get("input") or {}).get("query", ""),
+            "assistant_response": (raw.get("generation") or {}).get(
+                "response_text", "") or "",
+            "tools_called": (raw.get("routing") or {}).get(
+                "tools_called", []) or [],
+            "route_layer": (raw.get("routing") or {}).get(
+                "route_layer", ""),
+            "shape_fired": (raw.get("retrieval") or {}).get(
+                "shape_fired", ""),
+            "recall_filtered": (raw.get("retrieval") or {}).get(
+                "recall_filtered", []) or [],
+        }
+        return record
+    except Exception as e:
+        print(f"[session] load_nth_turn({n}) failed: {e}", flush=True)
         return None
 
 
@@ -516,13 +751,31 @@ _RECENCY_QUERY_RE = re.compile(
     # Main 37 Fix 1: added chat(?:ted|ting)? so "what did we chat about last"
     # triggers the short-circuit. Previously only talk/discuss matched and
     # the bridge fell through to the full pipeline which lost the signal.
+    # M121 Stream C: added bare-phatic coverage — "where were we", "what
+    # were we working on", "what were we doing" — that previously fell
+    # through the regex entirely. M120 B conjunction check still decides
+    # whether a matched phatic short-circuits vs falls through to L2.
+    # M125.2 Stream C: added "what happened" + explicit-ordinal-session
+    # marker alternation. Closes M125.1 B Q4 replay gap: "what happened
+    # two sessions before last" reaches _parse_ordinal_nback downstream.
+    # Under-fit discipline (K8): "what happened" alone, or "what happened
+    # at Main 42" (no ordinal marker), MUST NOT match here — those are
+    # factual-recall shapes handled by L2. Required ordinal markers mirror
+    # _RECENCY_ORDINAL_NBACK_RE: (digits|spelled-1-10) + sessions? +
+    # (ago|back|before last). K9 ("what did we cover / what was the focus"
+    # variants) deferred to M125.3 per M125.2 directive §3.3 scope.
     r"(?:what\s+(?:did\s+we|were\s+we|have\s+we)\s+(?:talk(?:ed|ing)?|discuss(?:ed|ing)?|chat(?:ted|ting)?)"
     r"|what\s+was\s+(?:our\s+)?last\s+(?:session|conversation|chat)"
     r"|last\s+session"
     r"|previous\s+(?:session|conversation|chat|discussion)"
     r"|what\s+did\s+we\s+do\s+last"
     r"|where\s+did\s+we\s+leave\s+off"
-    r"|what.{0,8}(?:was|were)\s+we\s+(?:working\s+on|doing|discussing|chatting\s+about)\s+last)",
+    r"|where\s+(?:were|was)\s+we"  # m121_c_bare_phatic: "where were we?" / "where were we on X"
+    r"|what\s+(?:were|was)\s+we\s+(?:working\s+on|doing)"  # m121_c_bare_phatic: un-last-suffixed working/doing
+    r"|what.{0,8}(?:was|were)\s+we\s+(?:working\s+on|doing|discussing|chatting\s+about)\s+last"
+    r"|what\s+happened\s+(?:.{0,30}?\s+)?"  # m125_2_c: "what happened" with optional short bridge...
+    r"(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)"  # ...N (digit 1-99 or spelled 1-10)...
+    r"\s+sessions?\s+(?:ago|back|before\s+last))",  # ...+ sessions? + ago|back|before last
     re.IGNORECASE,
 )
 
@@ -531,6 +784,189 @@ def _is_recency_query(text: str) -> bool:
     if not text:
         return False
     return bool(_RECENCY_QUERY_RE.search(text))
+
+
+# m120_b_phatic_anchor_check
+# M120 Stream B — T84 (M119 routing_phatic_anchor_miss).
+#
+# The L0 phatic recency short-circuit was firing on queries like
+# "so where did we leave off on the direct IOKit loading thread?" —
+# the phatic head "where did we leave off" captured the query, ran
+# session_summary_recall, and never let L2 see the specific topical
+# anchor "the direct IOKit loading thread". Operator got a templated
+# prior-session block unrelated to what they asked about.
+#
+# Fix: if a phatic-recency query also carries a trailing topical
+# anchor (on/about/for/regarding/re: + multi-word specific phrase),
+# suppress the short-circuit and fall through to L2. Bare phatic
+# ("where did we leave off?") still short-circuits, so the fast path
+# is preserved. Default: fall-through on ambiguous matches. +1 L2
+# routing pass is an acceptable latency cost; faster-but-wrong is
+# worse than slower-but-correct.
+#
+# Conservative edges:
+#   - pronoun-only anchor ("...with that?") → still short-circuits
+#   - single short/common noun ("...on stuff") → still short-circuits
+#   - multi-word specific phrase ("...on the direct IOKit loading")
+#     → fall-through to L2
+
+# Pronouns and non-topical fillers that should NOT defeat the
+# short-circuit even when they follow a topic marker.
+_M120_B_PHATIC_PRONOUNS = {
+    "that", "this", "it", "them", "those", "these",
+    "us", "you", "me", "stuff", "things", "thing",
+    "everything", "anything", "something", "nothing",
+    "here", "there", "where", "whatever",
+}
+
+# Topic marker followed by at least one word of length >= 3. The
+# conjunction check inspects the captured tail for topical specificity.
+_M120_B_PHATIC_TOPIC_MARKER_RE = re.compile(
+    r"\b(?:on|about|for|regarding|re:)\s+(.+)$",
+    re.IGNORECASE,
+)
+
+
+def _m120_b_has_topical_anchor(text: str) -> bool:
+    """Return True when a phatic-recency query carries a specific
+    trailing topical anchor that should route through L2 semantic
+    routing instead of the L0 short-circuit.
+
+    Policy (from M120 Stream B directive):
+      - Explicit marker (on/about/for/regarding/re:) followed by a
+        multi-word phrase where at least one word has length >= 3
+        and is not a pronoun/generic filler → topical anchor present.
+      - Pronoun anchor only ("...with that?") → no topical anchor.
+      - Single short/common noun ("...on stuff") → no topical anchor.
+      - Ambiguous → default False (preserve short-circuit) to avoid
+        breaking the fast path; the multi-word requirement covers
+        T84-class queries while leaving bare phatic intact.
+    """
+    if not text:
+        return False
+    m = _M120_B_PHATIC_TOPIC_MARKER_RE.search(text)
+    if not m:
+        return False
+    tail = m.group(1).strip().rstrip("?.!,;:")
+    if not tail:
+        return False
+    # Strip leading determiners so "the direct IOKit loading" →
+    # "direct IOKit loading" for word-count and content checks.
+    _DETERMINERS = {"the", "a", "an", "our", "my", "your", "their"}
+    tokens = [t for t in re.split(r"\s+", tail) if t]
+    while tokens and tokens[0].lower().strip(".,;:?!") in _DETERMINERS:
+        tokens = tokens[1:]
+    if not tokens:
+        return False
+    # Content tokens = length >= 3 AND not a pronoun/generic filler.
+    content_tokens = []
+    for tok in tokens:
+        norm = tok.lower().strip(".,;:?!\"'")
+        if len(norm) < 3:
+            continue
+        if norm in _M120_B_PHATIC_PRONOUNS:
+            continue
+        content_tokens.append(norm)
+    # Conservative: require at least two content tokens OR one
+    # content token that is clearly specific (mixed-case / has a
+    # digit / length >= 6). Single common noun like "stuff" or
+    # "things" falls out via the pronoun set above; single specific
+    # noun like "IOKit" or "Bridge" survives via the specificity
+    # check below.
+    if len(content_tokens) >= 2:
+        return True
+    if len(content_tokens) == 1:
+        only = content_tokens[0]
+        raw = tokens[-1] if tokens else only
+        # Specific single-word anchor: contains a digit, has internal
+        # capitalization in the raw token (e.g. "IOKit", "OpenAI"),
+        # or length >= 6 (discriminates "IOKit" vs "stuff").
+        if any(c.isdigit() for c in only):
+            return True
+        if any(c.isupper() for c in raw[1:]):
+            return True
+        if len(only) >= 6:
+            return True
+    return False
+
+
+def _m120_b_should_short_circuit(text: str) -> bool:
+    """Combined predicate: phatic-recency match AND no topical anchor.
+
+    This is the gate the stream + non-stream handlers consult before
+    firing the L0 recency short-circuit. See _m120_b_has_topical_anchor
+    for the conjunction check.
+    """
+    if not _is_recency_query(text):
+        return False
+    if _m120_b_has_topical_anchor(text):
+        return False
+    return True
+
+
+def _is_turn_ordinal_query(text: str) -> bool:
+    """M125.2 Stream D — gate for turn-scope ordinal N-back short-circuit.
+
+    Turn-scope queries ("what did I ask 2 turns ago", "what was your
+    response 3 messages back", "what did we cover 5 exchanges ago")
+    do NOT match _RECENCY_QUERY_RE, which is phatic-session-shaped.
+    This predicate provides an independent entry point for the turn-
+    scope loader without widening the session-scope phatic regex.
+
+    Under-fit: requires an explicit ordinal marker (digit or spelled
+    1-10) + turn-level scope noun (turns/messages/exchanges). Anaphoric
+    queries that mention "turns" without a count are left to A5.1.
+    """
+    if not text:
+        return False
+    return bool(_TURN_ORDINAL_NBACK_RE.search(text))
+
+
+def _build_turn_recency_response(record):
+    """Compose a turn-level response for "N turns ago" queries.
+
+    M125.2 Stream D. Distinct from session-level _build_recency_response:
+    this renders ONE prior turn's user query + assistant response,
+    not a whole-session rollup. Header format:
+        "N turns ago, you asked: «query». I responded: «excerpt»."
+    """
+    if not record:
+        return ("I don't have a prior turn on file yet for that index. "
+                "Either this is early in the session or the turn "
+                "number you referenced exceeds the current history.")
+    nback = record.get("_nback") or 1
+    total = record.get("_total_available") or 0
+    user_q = (record.get("user_query") or "").strip()
+    resp = (record.get("assistant_response") or "").strip()
+    # Cap the response excerpt so a long prior answer doesn't dominate
+    # the output. 600 chars matches the recency_bridge rough budget.
+    EXCERPT = 600
+    excerpt = resp if len(resp) <= EXCERPT else resp[:EXCERPT].rstrip() + "…"
+    turn_ref = f"{nback} turn{'s' if nback != 1 else ''} ago"
+    lines = []
+    if user_q:
+        lines.append(
+            f"{turn_ref.capitalize()}, you asked: «{user_q}»."
+        )
+    else:
+        lines.append(
+            f"{turn_ref.capitalize()}, you didn't log a query text."
+        )
+    if excerpt:
+        lines.append(f"I responded: «{excerpt}»")
+    else:
+        lines.append("I didn't log a response for that turn.")
+    tools = record.get("tools_called") or []
+    if tools:
+        lines.append(
+            f"(Tools dispatched that turn: {', '.join(tools)}. "
+            f"Turn #{record.get('turn_number')} of {total} on disk.)"
+        )
+    else:
+        lines.append(
+            f"(Turn #{record.get('turn_number')} of {total} on disk.)"
+        )
+    return "\n".join(lines)
 
 
 def _build_recency_response(summary):
@@ -565,10 +1001,17 @@ def _build_recency_response(summary):
     corrections = summary.get("corrections") or []
     rules = summary.get("standing_rules") or []
 
+    # M125.1 Stream B: if ordinal N-back was requested, swap the header
+    # to identify which session we're returning ("3 sessions ago" rather
+    # than an unqualified "last session").
     lines = []
+    nback = summary.get("_nback") or 1
+    if nback == 1:
+        header = f"Our last session ended {end_iso}"
+    else:
+        header = f"The session {nback} sessions ago ended {end_iso}"
     lines.append(
-        f"Our last session ended {end_iso} and ran {duration_m:.0f} minutes "
-        f"across {turns} turns."
+        f"{header} and ran {duration_m:.0f} minutes across {turns} turns."
     )
     if topic_names:
         lines.append(
@@ -604,6 +1047,130 @@ def _build_recency_response(summary):
 # Cache at module load so the first message doesn't pay the disk read.
 _LAST_SESSION_SUMMARY = load_last_session_summary()
 _LAST_SESSION_BLOCK = format_last_session_block(_LAST_SESSION_SUMMARY)
+
+
+# ── Current-era session anchor: grounds briefing against retrieved stale memos ──
+#
+# M100 Agent A2: M87 T01/T19 + M99 T01/T02/T09/T11 all showed the model
+# narrating "We're in the aftermath of Main 42" / "transition from Main 53
+# to Main 54" months after those sessions closed. Audit found the stale
+# identifiers did NOT come from briefing_text — they came from per-query
+# recalled `claude_automemory` memos (e.g. `session_20260412_main42.md`)
+# labeled as "RELEVANT MEASUREMENTS" and from a stale `Roadmap.md` tool
+# result ("Updated: 2026-04-11 (Main 38)"). Without a current-era anchor
+# in the briefing, the model anchors on the highest-scored historical memo
+# and treats it as the current state.
+#
+# Fix (scope-narrow per directive §2.2, avoids A1's retrieval layer):
+# prepend a CURRENT SESSION CONTEXT block to the briefing that surfaces
+# the 2-3 most recent session-log dates with their latest bullet. This
+# gives the model an explicit "today is M100" anchor so retrieved M42/M53
+# memos read as history, not current state.
+#
+# Source: vault/CLAUDE_session_log.md — the append-only ground truth.
+# Parsed at module load + refreshed every _SESSION_BRIEFING_REFRESH_EVERY
+# turns so new close-log entries land in-session.
+
+_CLAUDE_SESSION_LOG_PATH = (
+    "/Users/midas/Desktop/cowork/vault/CLAUDE_session_log.md"
+)
+
+
+def _parse_current_session_anchor(
+    log_path: str = _CLAUDE_SESSION_LOG_PATH,
+    max_dates: int = 3,
+    max_chars: int = 900,
+) -> str:
+    """Extract the 2-3 most recent session-log day blocks and render a
+    compact anchor for the briefing. Surfaces session identifiers
+    (M95, M96, M99, M100, ...) so the model grounds "current era"
+    against them before synthesizing from retrieved memos.
+
+    Returns "" on any failure — the briefing still works without this
+    block, it just loses the staleness anchor.
+    """
+    try:
+        with open(log_path) as fh:
+            text = fh.read()
+    except Exception:
+        return ""
+    if not text:
+        return ""
+
+    # Find date-section headers: lines starting with "### YYYY-MM-DD"
+    # The log is newest-first by convention; we take the first N and,
+    # under each, the last 2 bullets (most-recent intra-day entries).
+    import re as _re
+    lines = text.splitlines()
+    header_idxs = [
+        i for i, ln in enumerate(lines)
+        if _re.match(r"^###\s+\d{4}-\d{2}-\d{2}", ln)
+    ]
+    if not header_idxs:
+        return ""
+
+    # Collect up to max_dates day blocks (newest first in the file).
+    blocks = []
+    for i, start in enumerate(header_idxs[:max_dates]):
+        end = header_idxs[i + 1] if i + 1 < len(header_idxs) else len(lines)
+        header = lines[start].strip()
+        # Extract date part
+        m = _re.match(r"^###\s+(\d{4}-\d{2}-\d{2})", header)
+        date_str = m.group(1) if m else header
+        # Collect bullets in this section
+        bullets = []
+        for ln in lines[start + 1:end]:
+            s = ln.strip()
+            if s.startswith("- "):
+                bullets.append(s[2:].strip())
+        # Take last 2 bullets (most recent intra-day) for the narrative.
+        tail = bullets[-2:] if bullets else []
+        # Extract session identifiers from ALL bullets in the date block so
+        # earlier-in-day work (M96/M97 opens) still surfaces even when the
+        # last 2 bullets happen to be closes/corrections. Sort descending so
+        # the anchor shows the highest (most recent) session identifiers.
+        ids = []
+        for b in bullets:
+            for tok in _re.findall(
+                r"(?<![\w-])(?:[Mm](?:ain)?\s*)(\d{1,3})\b", b
+            ):
+                tok_n = int(tok)
+                if 1 <= tok_n <= 999 and tok_n not in ids:
+                    ids.append(tok_n)
+        ids.sort(reverse=True)
+        blocks.append((date_str, tail, ids))
+
+    if not blocks:
+        return ""
+
+    # Render compact block. Show date + session IDs inline + 1-line summary.
+    parts = ["CURRENT SESSION CONTEXT (anchors current era — treat any "
+             "retrieved 'Main <NN>' memory from an earlier era as history, "
+             "not current state):"]
+    for date_str, tail, ids in blocks:
+        id_str = (
+            " sessions=" + ",".join(f"M{n}" for n in ids[:4])
+            if ids else ""
+        )
+        parts.append(f"  [{date_str}]{id_str}")
+        for b in tail:
+            # Strip bold markdown ** and timestamp prefix for compactness
+            clean = _re.sub(r"\*\*\[[^\]]+\]\*\*\s*", "", b)
+            clean = _re.sub(r"\*\*", "", clean)
+            # Trim to ~180 chars per bullet
+            if len(clean) > 180:
+                clean = clean[:177] + "..."
+            parts.append(f"    - {clean}")
+
+    block = "\n".join(parts)
+    if len(block) > max_chars:
+        block = block[:max_chars - 3] + "..."
+    return block
+
+
+# Cached at module load; refreshed periodically by _build_presentation_briefing.
+_CURRENT_SESSION_ANCHOR = _parse_current_session_anchor()
+_CURRENT_SESSION_ANCHOR_LOADED_AT = time.time()
 
 
 def _load_accumulated_standing_rules(max_summaries: int = 20) -> list:
@@ -817,6 +1384,293 @@ _TURN_LOG: dict = {}
 _LAST_TURN_END_TS = None
 
 
+# ── m109_zeta instrumentation helpers ──────────────────────────────────
+# Additive-only logging helpers for directive M109 ζ. Each function is pure
+# (no side-effects on module state) and returns a dict/scalar that is spliced
+# into the turn log at the write points in the two handlers. Upstream sources
+# were verified before wiring:
+#   - role_weight formula: local_store.py:434-435 + daemon.py:527-528
+#   - canonical boost multiplier (1.30) same two files
+#   - grounding gate state: answer_scrub.py:41 (TIER1_ENABLED)
+#   - stop_reason: no upstream signal preserved; 72B server always emits
+#     finish_reason="stop" (qwen_spec_decode_server.py:1628/1678). Inferred
+#     from tokens_decoded vs max_tokens and loop-detector flag per directive.
+
+
+# m109_zeta_field_1 + field_8: role_weight + canonical_boost multiplier.
+# Formula verified in local_store.py:434-435 and daemon.py:527-528.
+# Additional downweights (assistant 0.50, research 0.05 possessive,
+# user 0.30 possessive) are conditional on query-level flags not
+# exposed at this log point; we log the base provenance multiplier
+# that would apply at scoring time unconditionally.
+def _m109_role_weight(source_role: str) -> float:
+    """Return the multiplicative weight the recall scorer applies to a
+    memory based on its source_role tag. Derived from the formula at
+    local_store.py:434-435 and daemon.py:527-528. assistant=0.50,
+    canonical=1.30, everything else (user, vault, research, unknown)=1.00
+    at the base scoring level. Possessive-intent downweights (research
+    0.05, user 0.30) are query-conditional and not applied here."""
+    if source_role == "canonical":
+        return 1.30
+    if source_role == "assistant":
+        return 0.50
+    return 1.00
+
+
+def _m109_canonical_boost_multiplier(source_role: str) -> float:
+    """Per-record counterfactual: what multiplier WOULD canonical-boost
+    apply to this record if the global canonical_boost toggle were active.
+    Non-canonical records get 1.00 (no change). Canonical records get
+    1.30. Logged regardless of current global state per directive M107."""
+    if source_role == "canonical":
+        return 1.30
+    return 1.00
+
+
+def _m109_grounding_state() -> str:
+    """Report the current state of the Tier 1 grounding gate. Returns
+    one of: 'enabled', 'disabled', 'unknown'. Tier 1 is disabled by
+    default for Gemma 4 per answer_scrub.py:41 (TIER1_ENABLED)."""
+    try:
+        from answer_scrub import TIER1_ENABLED as _t1
+        return "enabled" if _t1 else "disabled"
+    except Exception:
+        return "unknown"
+
+
+def _m109_content_hash(text: str) -> str:
+    """Short content hash: SHA256 first 16 hex chars of the text. Used
+    for the post_turn.memories_stored_this_turn manifest so turn-to-turn
+    duplication can be detected offline without pulling the full text."""
+    try:
+        import hashlib
+        return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+def _m109_infer_stop_reason(tokens_decoded, max_tokens, loop_detected,
+                             gen_error=None, user_cancel=False):
+    """Midas-side inference of decode stop reason. The 72B server always
+    emits finish_reason='stop' regardless of the true cause, so we infer:
+      - user_cancel: caller sets flag (not currently plumbed; reserved)
+      - verifier_error: exception raised during streaming
+      - max_tokens: tokens_decoded reached (or exceeded) max_tokens cap
+      - loop_detected: Main 42 in-flight n-gram loop detector tripped
+      - eos: tokens_decoded < max_tokens and no error/loop => natural EOS
+      - unknown_v2: insufficient signal
+    Per directive M109 §3.1 field 4, this is best-effort inference —
+    the ideal fix is upstream preservation in qwen_spec_decode_server.py
+    (OUT OF SCOPE for this directive)."""
+    if user_cancel:
+        return "user_cancel"
+    if gen_error:
+        return "verifier_error"
+    if loop_detected:
+        return "loop_detected"
+    try:
+        if tokens_decoded is not None and max_tokens is not None:
+            if int(tokens_decoded) >= int(max_tokens):
+                return "max_tokens"
+            if int(tokens_decoded) > 0:
+                return "eos"
+    except Exception:
+        pass
+    return "unknown_v2"
+
+
+def _m123_a2_completion_reason(stop_reason):
+    """M123 Stream A2: derive generation.completion_reason enum from the
+    existing M109 stop_reason signal. Diagnose-first-then-fix found T36/T39
+    were Midas-side in-flight loop detector trips, NOT model-level truncation.
+    This field discriminates user-visible completion shapes:
+
+      - stop_token_end     : natural EOS from model
+      - max_tokens_reached : hit configured max_tokens cap
+      - stream_terminated  : Midas-side loop detector or scrub intervention
+      - completion_signal  : upstream finish_reason='stop' (generic)
+      - timeout            : wall-clock deadline exceeded (reserved)
+      - unknown            : insufficient signal
+
+    Conditional emission per ζ v2.2 extension. Additive; does not alter
+    M109 stop_reason semantics. Rationale: Lets M123+ separate legitimate
+    natural completions from truncation-class interventions without
+    disturbing existing M109 consumers."""
+    if stop_reason in ("eos", "stop_token_end"):
+        return "stop_token_end"
+    if stop_reason in ("max_tokens", "max_tokens_reached"):
+        return "max_tokens_reached"
+    if stop_reason in ("loop_detected", "user_cancel", "verifier_error",
+                        "stream_terminated"):
+        return "stream_terminated"
+    if stop_reason == "timeout":
+        return "timeout"
+    if stop_reason in ("unknown_v2", "unknown", None, ""):
+        return "unknown"
+    # Default pass-through for any upstream server-emitted finish_reason we
+    # don't explicitly recognize (preserves forward compatibility).
+    return "completion_signal"
+
+
+def _m109_memory_manifest(delta_count):
+    """Best-effort manifest of memories stored in the just-completed turn.
+    Reads daemon._session_facts (in-memory list of facts stored this
+    session) and returns the last `delta_count` entries as
+    {id, content_hash, source_role, extractor}. extractor is derived
+    from fact['extraction_source'] ('ane_8b' → '8b_ane', absent → 'cpu_heuristic')."""
+    try:
+        if not delta_count or delta_count <= 0:
+            return []
+        d = getattr(memory, "daemon", None)
+        if d is None:
+            return []
+        facts = getattr(d, "_session_facts", None)
+        if not facts:
+            return []
+        recent = facts[-int(delta_count):]
+        manifest = []
+        for f in recent:
+            if not isinstance(f, dict):
+                continue
+            ext_src = f.get("extraction_source") or ""
+            if ext_src == "ane_8b":
+                extractor = "8b_ane"
+            elif ext_src:
+                extractor = ext_src
+            else:
+                extractor = "cpu_heuristic"
+            manifest.append({
+                "id": f.get("id") or "",  # store.store() fact_id is returned but
+                                          # not written back into the dict; may be empty
+                "content_hash": _m109_content_hash(f.get("text", "")),
+                "source_role": f.get("source_role", "") or "",
+                "extractor": extractor,
+                "type": f.get("type", "") or "",
+            })
+        return manifest
+    except Exception:
+        return []
+
+
+def _m109_annotate_recall(filtered_list):
+    """Given the post-filter recall list, return a parallel list of
+    per-record telemetry dicts with role_weight (field 1), provenance
+    (field 7), and canonical_boost counterfactual (field 8). Designed
+    to be spliced into retrieval.recall_filtered alongside existing
+    score/source_role/type/text fields — the writer merges this by
+    index position."""
+    out = []
+    for r in filtered_list or []:
+        meta = r.get("metadata", {}) or {}
+        src = (r.get("source_role") or meta.get("source_role", "")) or ""
+        # Origin derivation — per directive M108 field 7.
+        # Heuristic: source_role is the primary signal. extraction_source
+        # is set on daemon-stored facts; user_utterance vs extraction is
+        # inferred from role tag + presence of extractor metadata.
+        origin = "unknown"
+        if src == "user":
+            origin = "user_utterance"
+        elif src == "assistant":
+            origin = "extraction"  # assistant-sourced facts come from extractor
+        elif src == "canonical":
+            origin = "canonical_inject"
+        elif src == "vault":
+            origin = "vault_sync"
+        elif src == "research":
+            origin = "research_import"
+        ext = (r.get("extraction_source")
+               or meta.get("extraction_source") or "")
+        if ext == "ane_8b":
+            extractor = "8b_ane"
+        elif ext:
+            extractor = ext
+        else:
+            extractor = None
+        out.append({
+            "role_weight": _m109_role_weight(src),
+            "canonical_boost_multiplier_if_active":
+                _m109_canonical_boost_multiplier(src),
+            "provenance": {
+                "origin": origin,
+                "original_turn": (r.get("original_turn")
+                                   or meta.get("original_turn")
+                                   or "not_consumed_this_turn"),
+                "extractor_if_any": extractor,
+            },
+        })
+    return out
+
+
+def _m109_tag_history_messages(msgs, briefing_present):
+    """For each message in the assembled-prompt msgs list, tag the
+    source_turn. system message → 'system'; briefing message (if the
+    system slot contains the briefing) → 'briefing'; history messages
+    → 'T<N>' via reverse-indexing from the current turn number.
+    Per directive §3.1 field 6 — makes conversation-history provenance
+    explicit instead of only inferrable by ordering."""
+    tagged = []
+    if not msgs:
+        return tagged
+    cur_turn = 0
+    try:
+        if _TURN_LOG:
+            cur_turn = int(_TURN_LOG.get("turn_number", 0) or 0)
+    except Exception:
+        cur_turn = 0
+    # Count history messages (non-system, non-tail-user). Last message
+    # is the current user turn. Anything before it that is not the
+    # system slot is history.
+    n = len(msgs)
+    # Identify the last user message index (current turn).
+    last_user_idx = -1
+    for i in range(n - 1, -1, -1):
+        if msgs[i].get("role") == "user":
+            last_user_idx = i
+            break
+    # Walk history pairs backward assigning turn numbers. Each prior
+    # (user, assistant) pair = one prior turn.
+    hist_indices = [i for i in range(n)
+                    if i != 0 and i != last_user_idx
+                    and msgs[i].get("role") in ("user", "assistant")]
+    # Pair them: every consecutive (user, assistant) pair represents
+    # one prior turn. Count backwards from (cur_turn - 1).
+    # Simple approach: assign turn number by descending index — most
+    # recent non-tail message = cur_turn - 1, next earlier = cur_turn - 2.
+    hist_turn_map = {}
+    pair_turn = cur_turn - 1 if cur_turn > 0 else 0
+    # Group consecutive user+assistant into one turn.
+    i = len(hist_indices) - 1
+    while i >= 0:
+        # assistant typically follows user; walk backward pairs
+        idx = hist_indices[i]
+        hist_turn_map[idx] = pair_turn
+        # previous index (user of same pair), assign same turn
+        if i - 1 >= 0 and msgs[hist_indices[i-1]].get("role") == "user":
+            hist_turn_map[hist_indices[i-1]] = pair_turn
+            i -= 2
+        else:
+            i -= 1
+        pair_turn = max(0, pair_turn - 1)
+
+    for i, m in enumerate(msgs):
+        role = m.get("role", "")
+        if i == 0 and role == "system":
+            # System slot: briefing if briefing_present else pure system prompt
+            src_turn = "briefing" if briefing_present else "system"
+        elif i == last_user_idx:
+            src_turn = f"T{cur_turn}"  # current turn
+        elif i in hist_turn_map:
+            src_turn = f"T{hist_turn_map[i]}"
+        else:
+            src_turn = "not_consumed_this_turn"
+        tagged.append({
+            "role": role,
+            "content": m.get("content", ""),
+            "source_turn": src_turn,
+        })
+    return tagged
+
+
 def _rough_tokens(text: str) -> int:
     """Char-based token estimate (chars / 4). Good enough for logging
     without pulling in tiktoken."""
@@ -1008,7 +1862,7 @@ def _turn_start(message: str) -> None:
         if _LAST_TURN_END_TS is not None:
             since_last = round(now - _LAST_TURN_END_TS, 2)
         _TURN_LOG = {
-            "schema_version": 1,
+            "schema_version": "2.3",  # m125_a2_zeta_v23 — adds retrieval.dispatch_decision
             "session_id": _SESSION_ID,
             "turn_number": _session.get("messages_sent", 0),
             "input": {
@@ -1217,6 +2071,29 @@ def _build_presentation_briefing(is_first_message: bool):
     else:
         presentation_briefing = _session_briefing
 
+    # Step 2b (M100 A2): prepend the current-session-era anchor so retrieved
+    # stale "Main 42 Session" / "Main 53 cross-turn" memos don't anchor the
+    # model's "current state" narration. Refresh on the same cadence as the
+    # seed-query briefing (cheap: one file read + regex).
+    try:
+        global _CURRENT_SESSION_ANCHOR, _CURRENT_SESSION_ANCHOR_LOADED_AT
+        # Refresh when the seed briefing refreshes (or first time through)
+        _anchor_age_s = time.time() - (_CURRENT_SESSION_ANCHOR_LOADED_AT or 0)
+        if (not _CURRENT_SESSION_ANCHOR) or _anchor_age_s > 600:
+            _CURRENT_SESSION_ANCHOR = _parse_current_session_anchor()
+            _CURRENT_SESSION_ANCHOR_LOADED_AT = time.time()
+        if _CURRENT_SESSION_ANCHOR:
+            if presentation_briefing:
+                presentation_briefing = (
+                    _CURRENT_SESSION_ANCHOR + "\n\n" + presentation_briefing
+                )
+            else:
+                presentation_briefing = _CURRENT_SESSION_ANCHOR
+    except Exception as _e:
+        # Anchor is defense in depth; briefing still works without it.
+        print(f"[briefing] current-session anchor build failed: {_e}",
+              flush=True)
+
     # Step 3: on message #1, prepend session-open status + PRIOR SESSION bridge.
     if is_first_message:
         try:
@@ -1324,7 +2201,16 @@ def _measurement_registry_lookup(query: str, max_results: int = 5) -> list[str]:
                 'me', 'much', 'many', 'find', 'show', 'give', 'list'}
 
     matches = []
+    # M104: mirror of M102 narrative_retrieval fix. Some registry entries are
+    # bare scalars (float/bool/str) written by pipeline tools (e.g.
+    # tools/m96/m96_analyze.py) that bypass the dict schema. Skip them here
+    # so a single malformed row can't abort the main recall path's
+    # measurement-registry lookup with `'float' object has no attribute 'get'`.
+    # Root cause + full catalog in
+    # vault/agent_reports/m102_narrative_retrieval_fix.md.
     for key, entry in _MEASUREMENT_REGISTRY_CACHE.items():
+        if not isinstance(entry, dict):
+            continue
         aliases = [a.lower() for a in entry.get("aliases", [])]
         entity = entry.get("entity", "").lower()
         mtype = entry.get("measurement_type", "").lower().replace("_", " ")
@@ -1419,14 +2305,45 @@ def _build_per_query_block(filtered, query: str):
     prefix KV cache stays byte-stable across turns.
 
     Returns None if filtered is empty or formatting fails.
+
+    M122 A1: max_chars raised 1500 -> 2400 (K2 fires). Canonical-reserve
+    in multi_path_retrieve.present() alone closes T51 (specific canonical
+    at pool pos 4-5 now renders) but not T68 (query-relevant canonical at
+    pool pos 5 is outscored by an off-topic canonical at pool pos 3 so
+    reserve picks the wrong one). Raising to 2400 widens the budget so
+    both the off-topic and query-relevant canonicals render. Prefix-cache
+    impact measured in M122 A1 stream report; revert path on K1 is to
+    narrow the canonical-reserve slot instead.
     """
     if not filtered:
         return None
     try:
         import sys as _sys
         _sys.path.insert(0, "/Users/midas/Desktop/cowork/vault/subconscious")
+        # m122_a3_zeta_v22: import the truncation-manifest accessor so the
+        # per-query block can emit retrieval.per_query_truncated_items into
+        # the turn log. Additive + optional per Pattern-1 guardrail.
         from multi_path_retrieve import present as _present
-        return _present(filtered, query, max_chars=1500)
+        try:
+            from multi_path_retrieve import (
+                get_last_truncated_items as _get_truncated,
+            )
+        except ImportError:
+            _get_truncated = None  # older module without the accessor
+        _block = _present(filtered, query, max_chars=2400)
+        # m122_a3_zeta_v22: capture per-query truncation manifest from the
+        # side channel. A1 will populate fuller heuristics; A3 ships the
+        # field. Emit only when non-empty to keep turn JSONs lean on turns
+        # where nothing was truncated (Pattern-1 conditional emit).
+        if _get_truncated is not None:
+            try:
+                _truncated = _get_truncated()
+                if _truncated:
+                    _turn_record("retrieval",
+                                 per_query_truncated_items=_truncated)
+            except Exception:
+                pass
+        return _block
     except Exception:
         return None
 
@@ -1734,8 +2651,61 @@ def api_chat():
             # retrieval, no LLM synthesis. This is the route the directive
             # specifies: "route to the session summary directly, not through
             # narrative retrieval."
-            if _is_recency_query(message):
-                recency_summary = load_last_session_summary()
+            # m120_b_phatic_anchor_check: conjunction check — phatic-recency
+            # with a trailing topical anchor falls through to L2 instead of
+            # firing the L0 short-circuit. Closes M119 T84.
+            # M125.2 Stream D: turn-scope short-circuit. Independent
+            # gate from phatic session-recency — fires on explicit
+            # "N turns/messages/exchanges ago" queries and routes to
+            # the within-session turn log rather than the cross-session
+            # summary corpus. Checked BEFORE the session-scope gate so
+            # turn-scope doesn't get swallowed by a session-phatic
+            # false positive.
+            _parsed_scoped = _parse_ordinal_nback(message)
+            if (_parsed_scoped and _parsed_scoped[1] == "turn"
+                    and _is_turn_ordinal_query(message)):
+                _turn_n = _parsed_scoped[0]
+                turn_record = load_nth_turn(_turn_n)
+                turn_response = _build_turn_recency_response(turn_record)
+                _all_user_queries.append(message)
+                _history.append({"role": "user", "content": message})
+                _history.append({"role": "assistant",
+                                 "content": turn_response})
+                _history = _trim_history(_history, MAX_HISTORY)
+                _add_feed("recency",
+                          f"turn-ago bridge: {message[:60]}")
+                return jsonify({
+                    "response": turn_response,
+                    "tool": "turn_log_recall",
+                    "tool_args": {
+                        "turn_path": (turn_record or {}).get("_path"),
+                        "nback": _turn_n,
+                        "scope": "turn",
+                        "total_available":
+                            (turn_record or {}).get("_total_available", 0),
+                    },
+                    "route_layer": "L0",
+                    "memories_recalled": [],
+                    "stats": {},
+                })
+
+            if _m120_b_should_short_circuit(message):
+                # M125.1 Stream B: if query carries ordinal N-back
+                # ("three sessions ago", "2 sessions back"), load the
+                # Nth-from-latest summary instead of [0]. If N exceeds
+                # stored history, fall back to latest with caveat text.
+                # M125.2 Stream D: classifier now returns (n, scope);
+                # only session-scope reaches this branch (turn-scope
+                # is short-circuited above).
+                _parsed_sess = _parse_ordinal_nback(message)
+                if (_parsed_sess and _parsed_sess[1] == "session"
+                        and _parsed_sess[0] > 1):
+                    recency_summary = load_nth_session_summary(
+                        _parsed_sess[0])
+                    if recency_summary is None:
+                        recency_summary = load_last_session_summary()
+                else:
+                    recency_summary = load_last_session_summary()
                 recency_response = _build_recency_response(recency_summary)
                 _all_user_queries.append(message)
                 _history.append({"role": "user", "content": message})
@@ -1747,6 +2717,7 @@ def api_chat():
                     "tool": "session_summary_recall",
                     "tool_args": {
                         "summary_path": (recency_summary or {}).get("_path"),
+                        "nback": (recency_summary or {}).get("_nback", 1),
                     },
                     "route_layer": "L0",
                     "memories_recalled": [],
@@ -1763,15 +2734,21 @@ def api_chat():
             # Main 62 Bug 1: pass the prior user turn so anaphoric
             # web-search follow-ups ("can you do a web search?") can
             # fold in the prior subject.
+            # M125 A5.1: also pass `_last_tool` so anaphoric follow-ups
+            # can re-fire the prior turn's tool with subject-fold-in.
+            global _last_tool
             _prior_user = ""
             for _h in reversed(_history):
                 if _h.get("role") == "user":
                     _prior_user = _h.get("content", "")
                     break
-            l1_result = layer1_route(message, prior_user_message=_prior_user)
+            l1_result = layer1_route(message,
+                                      prior_user_message=_prior_user,
+                                      prior_tool=_last_tool or "")
             tool_name, tool_args = route(
                 message, llm_fn=llm_route_fn,
-                prior_user_message=_prior_user)
+                prior_user_message=_prior_user,
+                prior_tool=_last_tool or "")
             route_layer = "L1" if l1_result else "L2"
 
             # 3. Recall memories (subconscious) — skip for casual greetings
@@ -1786,7 +2763,11 @@ def api_chat():
                     # Main 43 Phase 3: pass topic boost from context tracker
                     _ct = _get_context_tracker()
                     _cb = _ct.get_retrieval_boost() if _ct else None
-                    recall_result = memory.recall(message, n_results=15,
+                    # m118_e_sub_shape_2: fold antecedent into recall query
+                    # when user uses a demonstrative/pronoun.
+                    _recall_q = _m118_e_expand_query_with_antecedent(
+                        message, _history)
+                    recall_result = memory.recall(_recall_q, n_results=15,
                                                   context_boost=_cb)
                 else:
                     recall_result = None
@@ -1902,6 +2883,31 @@ def api_chat():
 
             # 4. Execute tool or direct conversation
             tool_result = None
+            # M125 A5.2: meta-instruction acknowledge-only short-circuit.
+            # tool_name == "meta_instruction_ack" means L1 detected a
+            # standing instruction / behavior-modification cue. We skip
+            # generation entirely and return the prebuilt acknowledgement
+            # so the model does NOT treat the instruction as a content
+            # query. Ship level per K15: ACK ONLY — commit-to-rules is
+            # separate work.
+            if tool_name == "meta_instruction_ack":
+                _meta_response = (tool_args or {}).get(
+                    "response",
+                    "Understood — I've noted that instruction.")
+                _all_user_queries.append(message)
+                _history.append({"role": "user", "content": message})
+                _history.append({"role": "assistant",
+                                 "content": _meta_response})
+                _history = _trim_history(_history, MAX_HISTORY)
+                _last_tool = "meta_instruction_ack"
+                return jsonify({
+                    "response": _meta_response,
+                    "tool": tool_name,
+                    "tool_args": tool_args,
+                    "route_layer": route_layer,
+                    "memories_recalled": [],
+                    "stats": {},
+                })
             if tool_name != "conversation":
                 _session["tools_used"] += 1
                 tool_result = execute(tool_name, tool_args)
@@ -1958,7 +2964,27 @@ def api_chat():
                         augmented = f"{_reg_block}\n\n---\n\n{message}"
                     elif per_query_block:
                         augmented = f"{per_query_block}\n\n---\n\n{message}"
-                    response = synthesize(llm_fn, _history, augmented,
+                    # m113_alpha_history_filter: see /api/chat/stream wiring
+                    # above for rationale. Same detector, same shape (a).
+                    try:
+                        from history_reinforcement_filter import (
+                            filter_history_for_reinforcement as _m113_filter,
+                            count_marked as _m113_count_marked,
+                        )
+                        _history_for_prompt = _m113_filter(
+                            _history, current_query=message)
+                        _turn_record(
+                            "history_filter",
+                            marked=_m113_count_marked(_history_for_prompt),
+                            total_history_turns=len(_history),
+                            filter_shape="mark_low_confidence",
+                            variant="m113_alpha",
+                        )
+                    except Exception as _m113_err:
+                        print(f"[m113_alpha_history_filter] bypass: {_m113_err}",
+                              flush=True)
+                        _history_for_prompt = _history
+                    response = synthesize(llm_fn, _history_for_prompt, augmented,
                                           temperature=0.3,
                                           briefing=presentation_briefing,
                                           standing_rules=_ACTIVE_STANDING_RULES)
@@ -1966,8 +2992,27 @@ def api_chat():
                 augmented = message
                 if per_query_block:
                     augmented = (f"{per_query_block}\n\n---\n\n{message}")
+                # m113_alpha_history_filter: non-conversation (tool) path.
+                try:
+                    from history_reinforcement_filter import (
+                        filter_history_for_reinforcement as _m113_filter,
+                        count_marked as _m113_count_marked,
+                    )
+                    _history_for_prompt = _m113_filter(
+                        _history, current_query=message)
+                    _turn_record(
+                        "history_filter",
+                        marked=_m113_count_marked(_history_for_prompt),
+                        total_history_turns=len(_history),
+                        filter_shape="mark_low_confidence",
+                        variant="m113_alpha",
+                    )
+                except Exception as _m113_err:
+                    print(f"[m113_alpha_history_filter] bypass: {_m113_err}",
+                          flush=True)
+                    _history_for_prompt = _history
                 response = synthesize(
-                    llm_fn, _history, augmented,
+                    llm_fn, _history_for_prompt, augmented,
                     tool_name=tool_name, tool_args=tool_args,
                     tool_result=tool_result, temperature=0.3,
                     max_tokens=1500,
@@ -1979,8 +3024,10 @@ def api_chat():
             # Regenerate if garbage (too short, just a number) — but skip
             # for memory_ingest, which intentionally returns a short ack.
             if len(response.strip()) < 10 and tool_name != "memory_ingest":
+                # m113_alpha_history_filter: regeneration path inherits the
+                # same filtered history as the first attempt.
                 response = synthesize(
-                    llm_fn, _history, augmented,
+                    llm_fn, _history_for_prompt, augmented,
                     tool_name=tool_name if tool_name != "conversation" else None,
                     tool_args=tool_args if tool_name != "conversation" else None,
                     tool_result=tool_result if tool_name != "conversation" else None,
@@ -2045,6 +3092,11 @@ def api_chat():
                 _idle_queue.schedule(
                     injected_memories=_last_subconscious,
                     response_text=response)
+
+            # M125 A5.1: stash the tool dispatched this turn so the next
+            # anaphoric / subject-continuity follow-up can re-fire it
+            # with subject composed in.
+            _last_tool = tool_name or ""
 
             return jsonify({
                 "response": response,
@@ -2575,8 +3627,18 @@ def api_chat_stream():
                 _pipeline_start_ts = time.time()
                 def _pipeline_extract(resp_text, recall_ctx):
                     try:
-                        memory.ingest("assistant", resp_text,
+                        _ai_result = memory.ingest("assistant", resp_text,
                                       recall_context=recall_ctx)
+                        # M104 F1: mirror /api/chat midas-extraction feed
+                        # write. Pipeline extraction is async so the feed
+                        # entry lands on the NEXT turn's start, tagged
+                        # with the stashed response text.
+                        try:
+                            if isinstance(_ai_result, dict) and _ai_result.get("extracted", 0) > 0:
+                                _session["facts_extracted"] = _session.get("facts_extracted", 0) + int(_ai_result["extracted"])
+                                _add_feed("extraction", f"[midas] {resp_text[:80]}")
+                        except Exception:
+                            pass
                     except Exception as _pe:
                         print(f"[pipeline] extraction error: {_pe}",
                               flush=True)
@@ -2620,12 +3682,76 @@ def api_chat_stream():
                          user_ingest_ms=int((_ingest_end - _ingest_start) * 1000),
                          user_ingest_started_ts=_ingest_start,
                          user_ingest_ended_ts=_ingest_end)
+            # M104 F1: mirror /api/chat feed-write on user extraction so
+            # the feed populates for stream-endpoint traffic (UI). The
+            # recall-path and midas-ext mirrors live further below.
+            try:
+                if isinstance(ingest_result, dict) and ingest_result.get("extracted", 0) > 0:
+                    _session["facts_extracted"] = _session.get("facts_extracted", 0) + int(ingest_result["extracted"])
+                    _add_feed("extraction", f"[user] {message[:80]}")
+            except Exception:
+                pass
 
             # Main 37: recency short-circuit (stream variant). Matches the
             # /api/chat behavior — route "what did we talk about last"
             # directly to the prior session summary, not through retrieval.
-            if _is_recency_query(message):
-                recency_summary = load_last_session_summary()
+            # m120_b_phatic_anchor_check: conjunction check — phatic-recency
+            # with a trailing topical anchor falls through to L2 instead of
+            # firing the L0 short-circuit. Closes M119 T84.
+            # M125.2 Stream D: turn-scope short-circuit (stream variant).
+            # Independent from phatic session-recency gate — fires on
+            # explicit "N turns/messages/exchanges ago" queries and
+            # routes to the within-session turn log. See /api/chat
+            # handler for the non-stream twin.
+            _parsed_scoped = _parse_ordinal_nback(message)
+            if (_parsed_scoped and _parsed_scoped[1] == "turn"
+                    and _is_turn_ordinal_query(message)):
+                _turn_n = _parsed_scoped[0]
+                turn_record = load_nth_turn(_turn_n)
+                turn_response = _build_turn_recency_response(turn_record)
+                _all_user_queries.append(message)
+                _history.append({"role": "user", "content": message})
+                _history.append({"role": "assistant",
+                                 "content": turn_response})
+                _history = _trim_history(_history, MAX_HISTORY)
+                _add_feed("recency",
+                          f"turn-ago bridge (stream): {message[:60]}")
+                _turn_record("routing",
+                             route_layer="L0",
+                             l1_match="turn_ordinal_short_circuit",
+                             l2_decision=None,
+                             tools_called=["turn_log_recall"])
+                _turn_record("retrieval",
+                             shape_fired="turn_recency_bridge",
+                             turn_path=(turn_record or {}).get("_path"),
+                             ordinal_nback=_turn_n,
+                             ordinal_scope="turn",
+                             turn_total_available=(turn_record or {}).get(
+                                 "_total_available", 0))
+                _turn_record("generation",
+                             response_text=turn_response,
+                             response_chars=len(turn_response),
+                             response_tokens_est=_rough_tokens(turn_response),
+                             ttft_ms=0, total_ms=0)
+                _turn_write()
+                yield f"data: {json.dumps({'type':'token','content':turn_response})}\n\n"
+                yield f"data: {json.dumps({'type':'done','stats':{},'memories_recalled':0})}\n\n"
+                return
+
+            if _m120_b_should_short_circuit(message):
+                # M125.1 Stream B: ordinal N-back routing (stream variant).
+                # See /api/chat handler above for the same logic.
+                # M125.2 Stream D: classifier returns (n, scope);
+                # only session-scope reaches this branch.
+                _parsed_sess = _parse_ordinal_nback(message)
+                if (_parsed_sess and _parsed_sess[1] == "session"
+                        and _parsed_sess[0] > 1):
+                    recency_summary = load_nth_session_summary(
+                        _parsed_sess[0])
+                    if recency_summary is None:
+                        recency_summary = load_last_session_summary()
+                else:
+                    recency_summary = load_last_session_summary()
                 recency_response = _build_recency_response(recency_summary)
                 _all_user_queries.append(message)
                 _history.append({"role": "user", "content": message})
@@ -2638,7 +3764,8 @@ def api_chat_stream():
                              l2_decision=None,
                              tools_called=["session_summary_recall"])
                 _turn_record("retrieval", shape_fired="recency_bridge",
-                             summary_path=(recency_summary or {}).get("_path"))
+                             summary_path=(recency_summary or {}).get("_path"),
+                             ordinal_nback=(recency_summary or {}).get("_nback", 1))
                 _turn_record("generation",
                              response_text=recency_response,
                              response_chars=len(recency_response),
@@ -2651,19 +3778,52 @@ def api_chat_stream():
 
             # Route
             # Main 62 Bug 1: pass prior user turn for anaphoric fold-in.
+            # M125 A5.1: pass _last_tool so anaphoric follow-ups re-fire
+            # the prior tool with subject composed in.
+            global _last_tool
             _prior_user = ""
             for _h in reversed(_history):
                 if _h.get("role") == "user":
                     _prior_user = _h.get("content", "")
                     break
-            l1_result = layer1_route(message, prior_user_message=_prior_user)
+            l1_result = layer1_route(message,
+                                      prior_user_message=_prior_user,
+                                      prior_tool=_last_tool or "")
             tool_name, tool_args = route(
                 message, llm_fn=llm_route_fn,
-                prior_user_message=_prior_user)
+                prior_user_message=_prior_user,
+                prior_tool=_last_tool or "")
             _turn_record("routing",
                          l1_match=(l1_result[0] if l1_result else None),
                          l2_decision=tool_name,
                          route_layer=("L1" if l1_result else "L2"))
+
+            # M125 A5.2: meta-instruction short-circuit in stream path.
+            # Same acknowledge-only behavior as non-stream path. Emits the
+            # prebuilt ACK response and returns immediately — no recall,
+            # no generation, no LLM contact.
+            if tool_name == "meta_instruction_ack":
+                _meta_response = (tool_args or {}).get(
+                    "response",
+                    "Understood — I've noted that instruction.")
+                _all_user_queries.append(message)
+                _history.append({"role": "user", "content": message})
+                _history.append({"role": "assistant",
+                                 "content": _meta_response})
+                _history = _trim_history(_history, MAX_HISTORY)
+                _last_tool = "meta_instruction_ack"
+                _turn_record("generation",
+                             response_text=_meta_response,
+                             response_chars=len(_meta_response),
+                             response_tokens_est=_rough_tokens(_meta_response),
+                             ttft_ms=0, total_ms=0,
+                             skipped=True,
+                             skip_reason="meta_instruction_ack")
+                _turn_write()
+                yield f"data: {json.dumps({'type':'token','content':_meta_response})}\n\n"
+                yield f"data: {json.dumps({'type':'done','stats':{},'memories_recalled':0})}\n\n"
+                return
+
             # tools_called list is populated only on actual execute() below,
             # not on routing intent. l2_decision captures the intent.
             # Heuristic: did the user ask for a tool by name or intent
@@ -2709,15 +3869,50 @@ def api_chat_stream():
             _last_subconscious = []
             _narrative_used = False
             nr = None  # track narrative result for absence guard
+            # m125_3_e_enumeration_plumbing: dedicated enumeration payload
+            # block that reaches the prompt via the user-message tail
+            # (mirrors per_query_block/_reg_block). Prior bug: enumeration
+            # records were put in mem_ctx only, which is gated by
+            # synthesizer.build_messages' `elif briefing:` branch — briefing
+            # is always present, so records never reached the prompt. The
+            # absence-guard word-overlap check (Sub-Gate 3) also overwrote
+            # mem_ctx to a KNOWLEDGE GAP warning on enumeration turns
+            # (Q10 in M125.2 E pilot readiness: 4 published_repo records
+            # replaced by CRITICAL GAP warning, then silently dropped at
+            # synthesizer.build_messages). Track the enumeration payload
+            # as a separate block and flag the source so both drop sites
+            # are bypassed. See vault/agent_reports/m125_3_e_enumeration_plumbing.md.
+            _enumeration_block = None
+            _enumeration_active = False
 
             # Phase 2a: enumeration check (shape #6) — complete tag-based retrieval
             try:
                 if inject_context:
-                    from enumeration_retrieval import enumerate_by_tag
+                    from enumeration_retrieval import enumerate_by_tag, shape_dispatch_signal
                     _enum = enumerate_by_tag(message)
                     if _enum:
                         mem_ctx = _enum["records"]
                         _narrative_used = True
+                        # m125_3_e_enumeration_plumbing: build the
+                        # enumeration block that will ride in the user
+                        # message tail so the model sees it. Format
+                        # matches the existing per_query_block /
+                        # _reg_block conventions (header + bullet list).
+                        try:
+                            _enum_header = (
+                                f"[ENUMERATION: complete set of "
+                                f"{_enum.get('tag')} records "
+                                f"(count={_enum.get('count')})]"
+                            )
+                            _enum_lines = list(_enum.get("records") or [])
+                            if _enum_lines:
+                                _enumeration_block = (
+                                    _enum_header + "\n" + "\n".join(_enum_lines)
+                                )
+                                _enumeration_active = True
+                        except Exception:
+                            _enumeration_block = None
+                            _enumeration_active = False
                         _emit_subconscious_event(
                             "enumeration_fired",
                             query=message[:100],
@@ -2734,12 +3929,51 @@ def api_chat_stream():
                                          "topic_filter": _enum.get("topic_filter"),
                                          "latency_ms": _enum.get("latency_ms"),
                                      })
+                    else:
+                        # m120_e_enumeration_dispatcher: even when tag-query
+                        # execution returns None (K9 gap: unbacked tag like
+                        # published_repo), classify the shape so the turn
+                        # log reflects that Enumeration fired. Records fall
+                        # through to default_recall below; the missing
+                        # backing index is surfaced via backed=False so
+                        # observability catches the architectural gap.
+                        _sig = shape_dispatch_signal(message)
+                        if _sig:
+                            _turn_record("retrieval",
+                                         shape_fired="enumeration",
+                                         enumeration={
+                                             "tag": _sig.get("tag"),
+                                             "backed": _sig.get("backed"),
+                                             "count": 0,
+                                             "unbacked_gap": not _sig.get("backed"),
+                                         })
+                            _emit_subconscious_event(
+                                "enumeration_unbacked",
+                                query=message[:100],
+                                tag=_sig.get("tag"),
+                                backed=_sig.get("backed"),
+                                path="api_chat_stream")
             except Exception:
                 pass
 
+            # m125_a2_shape_precedence: classify query BEFORE narrative
+            # synthesis. If is_canonical_lookup fires, suppress narrative and
+            # jump directly to default_recall so canonical pool records load.
+            # See shape_precedence.py + M124 Stream A §Cause 4 (K5).
+            _m125_a2_is_cl = False
+            _m125_a2_diag = {"decision_reason": "not_classified"}
+            try:
+                _m125_a2_is_cl, _m125_a2_diag = _m125_a2_is_canonical_lookup(
+                    message or "")
+            except Exception as _e:
+                _m125_a2_is_cl = False
+                _m125_a2_diag = {"decision_reason": f"classifier_exception:{_e}"}
+            _m125_a2_dispatch_decision = _M125_A2_DD_OTHER
+
             # Phase 2b: narrative synthesis
             try:
-                if inject_context and not _narrative_used:
+                if (inject_context and not _narrative_used
+                        and not _m125_a2_is_cl):
                     # Phase 3: check pre-warmed cache first
                     nr = get_cached_narrative(message)
                     if not nr:
@@ -2748,6 +3982,7 @@ def api_chat_stream():
                     if nr:
                         mem_ctx = [nr["narrative"]]
                         _narrative_used = True
+                        _m125_a2_dispatch_decision = _M125_A2_DD_NARRATIVE
                         _emit_subconscious_event(
                             "narrative_synthesized",
                             query=message[:100],
@@ -2764,6 +3999,16 @@ def api_chat_stream():
                                          "arc_type": nr.get("arc_type"),
                                          "latency_ms": nr.get("latency_ms"),
                                      })
+                elif (inject_context and not _narrative_used
+                        and _m125_a2_is_cl):
+                    # Classifier suppressed narrative; default_recall runs next.
+                    _m125_a2_dispatch_decision = _M125_A2_DD_NARRATIVE_SUPPRESSED
+                    _emit_subconscious_event(
+                        "m125_a2_narrative_suppressed",
+                        query=message[:100],
+                        positive_match=_m125_a2_diag.get("positive_match"),
+                        decision_reason=_m125_a2_diag.get("decision_reason"),
+                        path="api_chat_stream")
             except Exception:
                 pass
             try:
@@ -2771,7 +4016,10 @@ def api_chat_stream():
                     # Main 43 Phase 3: pass topic boost from context tracker
                     _ct_s = _get_context_tracker()
                     _cb_s = _ct_s.get_retrieval_boost() if _ct_s else None
-                    recall_result = memory.recall(message, n_results=15,
+                    # m118_e_sub_shape_2: fold antecedent when demonstrative
+                    _recall_q_s = _m118_e_expand_query_with_antecedent(
+                        message, _history)
+                    recall_result = memory.recall(_recall_q_s, n_results=15,
                                                   context_boost=_cb_s) if inject_context else None
                     if recall_result and recall_result.get("results"):
                         filtered = []
@@ -2798,16 +4046,34 @@ def api_chat_stream():
                         # Turn log: capture the filtered recall with scores,
                         # source_role, and type so per-turn analysis can
                         # distinguish canonical from derived memories.
+                        # m109_zeta_field_1+7+8: per-record role_weight,
+                        # provenance, canonical_boost counterfactual.
+                        _m109_annot = _m109_annotate_recall(filtered)
+                        _recall_filtered_log = []
+                        for _idx, _r in enumerate(filtered):
+                            _rec = {
+                                "score": round(_r.get("score", 0), 3),
+                                "source_role": (_r.get("source_role")
+                                    or (_r.get("metadata", {}) or {}).get("source_role", "")),
+                                "type": (_r.get("type")
+                                    or (_r.get("metadata", {}) or {}).get("type", "")),
+                                "text": (_r.get("text") or "")[:400],
+                            }
+                            if _idx < len(_m109_annot):
+                                _rec.update(_m109_annot[_idx])
+                            _recall_filtered_log.append(_rec)
+                        # m125_a2: on successful default_recall when
+                        # classifier had suppressed narrative, record
+                        # recall_primary_canonical_lookup. Otherwise leave
+                        # OTHER (e.g. narrative was skipped for a non-A2
+                        # reason, or classifier didn't fire but narrative
+                        # also produced no result).
+                        if _m125_a2_is_cl:
+                            _m125_a2_dispatch_decision = (
+                                _M125_A2_DD_RECALL_PRIMARY)
                         _turn_record("retrieval",
                                      shape_fired="default_recall",
-                                     recall_filtered=[{
-                                         "score": round(_r.get("score", 0), 3),
-                                         "source_role": (_r.get("source_role")
-                                             or (_r.get("metadata", {}) or {}).get("source_role", "")),
-                                         "type": (_r.get("type")
-                                             or (_r.get("metadata", {}) or {}).get("type", "")),
-                                         "text": (_r.get("text") or "")[:400],
-                                     } for _r in filtered],
+                                     recall_filtered=_recall_filtered_log,
                                      score_stats=_retrieval_score_stats(filtered))
                         _emit_subconscious_event(
                             "memory_recalled",
@@ -2837,6 +4103,32 @@ def api_chat_stream():
                                 entities=_entities[:5] if isinstance(_entities, list) else [],
                                 query=message[:80],
                             )
+                        # M104 F1: mirror /api/chat recall feed-writes so
+                        # the UI feed shows recall events on stream traffic.
+                        if mem_ctx:
+                            _session["memories_recalled"] = (
+                                _session.get("memories_recalled", 0) + len(mem_ctx))
+                            for _m in mem_ctx[:3]:
+                                _add_feed("recall", str(_m)[:80])
+            except Exception:
+                pass
+
+            # m125_a2: emit dispatch_decision to ζ v2.3 turn log.
+            # Enum: narrative_primary | recall_primary_canonical_lookup |
+            #       narrative_suppressed_classifier | other.
+            # Written once per turn, after dispatch branches settle.
+            try:
+                _turn_record(
+                    "retrieval",
+                    dispatch_decision=_m125_a2_dispatch_decision,
+                    dispatch_decision_diagnostic={
+                        "is_canonical_lookup": bool(_m125_a2_is_cl),
+                        "positive_match": _m125_a2_diag.get("positive_match"),
+                        "negative_match": _m125_a2_diag.get("negative_match"),
+                        "a4_specific_matched": _m125_a2_diag.get(
+                            "a4_specific_matched", False),
+                        "decision_reason": _m125_a2_diag.get("decision_reason"),
+                    })
             except Exception:
                 pass
 
@@ -2870,21 +4162,54 @@ def api_chat_stream():
             # recall only returned low-confidence tangential matches.
             # The guard checks scores, not just emptiness.
             # Phase 4: absence guard with topical relevance check
-            _guard_eligible = not _narrative_used
+            # M115 β three-sub-gate split — see
+            # vault/agent_reports/m115_a1_beta_split_gate.md
+            #   Sub-Gate 1: pool==0 + narr=False → fire unconditionally
+            #               (drop domain-relevance silencing; A3 §9).
+            #   Sub-Gate 2: pool>0, max<0.5, word-overlap mismatch → fire.
+            #   Sub-Gate 3: pool>0, max>=0.5, word-overlap mismatch → DO
+            #               NOT fire; pass filtered (not []) so check_absence
+            #               has score context.
+            # m116_d_drop_narrative_used: eligibility predicate no longer
+            # consults _narrative_used. Silent hole at T1/T7/T8/T10 in M114
+            # pilot (pool==0 AND narrative_used==True → guard silent → model
+            # confabulates without safety net). β sub-gates (M115) evaluate
+            # narrative adequacy naturally via pool_size + max_score — when
+            # narrative correctly answers, pool is typically non-empty and
+            # max_score correlates, so Sub-Gate 3 suppresses. narrative_used
+            # retained in feature_vector below for M109 ζ F5 observability.
+            _guard_eligible = True  # m116_d_drop_narrative_used
             _guard_fired = False
             try:
                 if _guard_eligible and not mem_ctx:
-                    # Main 46 fix: zero recall = unconditional guard.
-                    # T04 bug: mem_ctx was empty so the guard block was
-                    # skipped entirely. Zero recall must always fire.
+                    # m115_beta_sub_gate_1: empty pool + narrative unused
+                    # → fire unconditionally. absence_guard.check_absence
+                    # now drops the _is_domain_relevant check on this
+                    # branch (A3 §9). Passing [] is correct here because
+                    # there truly is no recall pool.
+                    # m116_d_drop_narrative_used: pass None as narrative_result
+                    # so β sub-gates can run regardless of narrative state
+                    # (callee's narrative short-circuit would otherwise
+                    # re-introduce the silent hole downstream).
                     from absence_guard import check_absence
-                    guard = check_absence(message, [], nr)
+                    guard = check_absence(message, [], None)
                     if guard:
                         mem_ctx = [guard]
                         _guard_fired = True
                         _emit_subconscious_event("absence_guard_fired",
                             query=message[:100])
-                elif _guard_eligible and mem_ctx:
+                elif _guard_eligible and mem_ctx and not _enumeration_active:
+                    # m125_3_e_enumeration_plumbing: skip Sub-Gate 3 on
+                    # enumeration turns. Enumeration records are an
+                    # exhaustive deterministic payload from the tag
+                    # index — the query shape ("list all X") will
+                    # rarely share content-words with a record list
+                    # like "orion-ane: public GitHub repo", so the
+                    # word-overlap heuristic false-fires and overwrites
+                    # mem_ctx with a KNOWLEDGE GAP warning (Q10 failure
+                    # mode in M125.2 E pilot readiness). The enumeration
+                    # block itself still rides the user-message tail via
+                    # _enumeration_block regardless of this branch.
                     # Topical relevance: do the recalled memories actually
                     # address the specific question, or just match the entity?
                     _q_words = set(w.lower().strip("?.,!\"'") for w in message.split() if len(w) >= 4)
@@ -2896,9 +4221,20 @@ def api_chat_stream():
                         _mem_text = " ".join(str(m) for m in mem_ctx).lower()
                         _unmatched = [w for w in _q_specific if w not in _mem_text]
                         if len(_unmatched) > len(_q_specific) * 0.5:
-                            # Recalled memories don't cover the query's specific terms
+                            # m115_beta_sub_gate_3: word-overlap mismatch.
+                            # Pass the actual `filtered` recall pool (not
+                            # []) so check_absence can see the score
+                            # context. High-score rows (>=0.5) suppress
+                            # the guard (Sub-Gate 3 FP fix). Low-score or
+                            # empty rows fall through to Sub-Gate 2
+                            # low-score firing path.
+                            # m116_d_drop_narrative_used: pass None so β
+                            # sub-gates evaluate independently of narrative.
                             from absence_guard import check_absence
-                            guard = check_absence(message, [], nr)
+                            _sg3_pool = (filtered
+                                         if 'filtered' in locals()
+                                         and filtered else [])
+                            guard = check_absence(message, _sg3_pool, None)
                             if guard:
                                 mem_ctx = [guard]
                                 _guard_fired = True
@@ -2910,10 +4246,63 @@ def api_chat_stream():
             if 'filtered' in locals() and filtered:
                 _recall_score_max_for_log = max(
                     float(r.get("score", 0)) for r in filtered)
+            # m109_zeta_field_5: full absence-guard feature vector.
+            # Per M108 Finding 3, the operative predicate is the conjunction
+            # at line ~3378: (_guard_fired AND recall_score_max < threshold
+            # AND tool_name == 'conversation'|None). Log everything that
+            # conjunction consumes so M108 validation can reconstruct the
+            # decision offline. word-overlap path consumes _q_specific and
+            # _unmatched — log those too when that branch fired.
+            _abs_pool_size = (len(filtered) if 'filtered' in locals()
+                              and filtered else 0)
+            _abs_features = {
+                "max_score": round(_recall_score_max_for_log, 3),
+                "pool_size": _abs_pool_size,
+                "threshold_applied": _absence_threshold,
+                "threshold_sensitivity": _absence_sensitivity,
+                "query_type_dispatch": _m73_dispatch.get("query_type"),
+                "narrative_used": _narrative_used,
+                "mem_ctx_empty_branch": (_guard_eligible and
+                                          not ('filtered' in locals()
+                                               and filtered)),
+                "word_overlap_branch_eligible":
+                    _guard_eligible and bool(mem_ctx)
+                    and ('filtered' in locals() and bool(filtered)),
+                "m74_a2_active": _m74_a2_active,
+            }
+            # word-overlap branch features (only populated if that branch ran)
+            try:
+                if '_q_specific' in locals() and _q_specific:
+                    _abs_features["q_specific_count"] = len(_q_specific)
+                    _abs_features["q_unmatched_count"] = (
+                        len(_unmatched) if '_unmatched' in locals() else 0)
+                    _abs_features["unmatched_ratio"] = round(
+                        (len(_unmatched) / max(1, len(_q_specific)))
+                        if '_unmatched' in locals() else 0.0, 3)
+                else:
+                    _abs_features["q_specific_count"] = "not_consumed_this_turn"
+                    _abs_features["q_unmatched_count"] = "not_consumed_this_turn"
+                    _abs_features["unmatched_ratio"] = "not_consumed_this_turn"
+            except Exception:
+                pass
+            # m115_beta_zeta_v2_1: expose _is_domain_relevant() result +
+            # matched terms so post-M115 analyses can reconstruct the
+            # Gate-B decision without the local-keyword approximation
+            # used in M114. Per A3 §9 ζ v2.1 spec.
+            try:
+                from discovery_retrieval import _is_domain_relevant as _dr
+                _dr_relevant, _dr_terms = _dr(message)
+                _abs_features["is_domain_relevant_result"] = bool(_dr_relevant)
+                _abs_features["is_domain_relevant_matched_terms"] = (
+                    list(_dr_terms) if _dr_terms else [])
+            except Exception:
+                _abs_features["is_domain_relevant_result"] = "not_instrumented_v2_1"
+                _abs_features["is_domain_relevant_matched_terms"] = "not_instrumented_v2_1"
             _turn_record("retrieval", absence_guard={
                 "eligible": _guard_eligible,
                 "fired": _guard_fired,
                 "recall_score_max": round(_recall_score_max_for_log, 3),
+                "feature_vector": _abs_features,  # m109_zeta_field_5
             })
 
             # Main 46: Hard absence gate. If the guard fired on a
@@ -2930,9 +4319,42 @@ def api_chat_stream():
             #   strict  → 0.7 (canonical_lookup, historical, decision)
             #   normal  → 0.5 (current production default; code_gen, debugging, chit_chat)
             #   loose   → 0.3 (synthesis, conceptual, brainstorm — tolerate weak recall)
+            # M123 A3: Definitional-query suppression. Before the hard
+            # gate evaluates, classify the query. On a True fire, let
+            # the model generate from parametric knowledge (Tier 1 FAB
+            # scrub + Tier 2 binding scrub still run downstream — only
+            # the hard absence gate is suppressed). Under-fit; see
+            # absence_guard.is_definitional_query for pattern list.
+            _m123_a3_definitional_suppression = False
+            _m123_a3_definitional_diag = None
+            try:
+                from absence_guard import is_definitional_query
+                _def_fired, _def_diag = is_definitional_query(message)
+                _m123_a3_definitional_diag = _def_diag
+                if (_def_fired
+                        and _guard_fired
+                        and _recall_score_max_for_log < _absence_threshold
+                        and (tool_name == "conversation" or not tool_name)):
+                    _m123_a3_definitional_suppression = True
+            except Exception:
+                _m123_a3_definitional_suppression = False
+            # ζ v2.2 emission — conditional field per M123 directive §3.3
+            try:
+                if _m123_a3_definitional_suppression:
+                    _turn_record(
+                        "guard",
+                        absence_gate={
+                            "definitional_suppression": True,
+                            "definitional_diagnostic":
+                                _m123_a3_definitional_diag,
+                        },
+                    )
+            except Exception:
+                pass
             if (_guard_fired
                     and _recall_score_max_for_log < _absence_threshold
-                    and (tool_name == "conversation" or not tool_name)):
+                    and (tool_name == "conversation" or not tool_name)
+                    and not _m123_a3_definitional_suppression):
                 _absence_response = (
                     "I don't have information about that in our research. "
                     "This hasn't come up in any session I can find."
@@ -2954,7 +4376,15 @@ def api_chat_stream():
                 _history.append({"role": "user", "content": message})
                 _history.append({"role": "assistant", "content": _absence_response})
                 _history = _trim_history(_history, MAX_HISTORY)
-                _session["messages_sent"] = _session.get("messages_sent", 0) + 1
+                # M123 A5 fix: removed double-increment of messages_sent.
+                # Line 3252 (stream handler entry) already incremented
+                # messages_sent for this turn; re-incrementing here skipped
+                # a turn-number in the sequence and produced the "5 capture
+                # gaps" finding in M122 C. Pilot had 6 absence-gate fires
+                # (turns 11, 28, 30, 37, 47, 50) each followed by a
+                # phantom missing turn-number (12, 29, 31, 38, 48, 51).
+                # Absence-gate turns ARE captured correctly — only the
+                # counter was wrong. See vault/agent_reports/m123_a5_turn_write_reliability.md.
                 _turn_write()
                 yield f"data: {json.dumps({'type':'token','content':_absence_response})}\n\n"
                 yield f"data: {json.dumps({'type':'done','stats':{},'memories_recalled':len(_last_subconscious)})}\n\n"
@@ -3054,6 +4484,13 @@ def api_chat_stream():
                 blocks.append(_prior_turn_ctx)
             if _possessive_directive:
                 blocks.append(_possessive_directive)
+            # m125_3_e_enumeration_plumbing: enumeration payload reaches the
+            # prompt via the user-message tail (mirrors per_query_block).
+            # Fires only when the enumeration classifier dispatched and
+            # records were available — non-enumeration turns leave this
+            # block None and the user message is unchanged.
+            if _enumeration_block:
+                blocks.append(_enumeration_block)
             if per_query_block:
                 blocks.append(per_query_block)
             if blocks:
@@ -3073,6 +4510,8 @@ def api_chat_stream():
                          mem_ctx_text=(mem_ctx or []),
                          per_query_chars=len(per_query_block or ""),
                          per_query_preview=(per_query_block or "")[:600],
+                         enumeration_chars=len(_enumeration_block or ""),
+                         enumeration_active=bool(_enumeration_active),
                          system_tokens_est=_rough_tokens(presentation_briefing or ""),
                          user_tokens_est=_rough_tokens(augmented))
 
@@ -3090,9 +4529,31 @@ def api_chat_stream():
                     "information about this topic.")
 
             _tool_result_str = None  # M49 P2: available for grounding corpus
+            # m113_alpha_history_filter: mark prior-assistant abstain+project-
+            # state-claim turns low-confidence before history joins the prompt.
+            # Prevents T11→T20 cascade where "Milestone 1C pending" leaked
+            # across 5 turns via conversation history with zero supporting
+            # recall entries. Non-destructive: _history global is unchanged.
+            try:
+                from history_reinforcement_filter import (
+                    filter_history_for_reinforcement as _m113_filter,
+                    count_marked as _m113_count_marked,
+                )
+                _history_for_prompt = _m113_filter(_history, current_query=message)
+                _turn_record(
+                    "history_filter",
+                    marked=_m113_count_marked(_history_for_prompt),
+                    total_history_turns=len(_history),
+                    filter_shape="mark_low_confidence",
+                    variant="m113_alpha",
+                )
+            except Exception as _m113_err:
+                print(f"[m113_alpha_history_filter] bypass: {_m113_err}",
+                      flush=True)
+                _history_for_prompt = _history
             if tool_name == "conversation":
                 msgs = build_messages(
-                    _history, augmented,
+                    _history_for_prompt, augmented,
                     memory_context=mem_ctx,
                     briefing=presentation_briefing,
                     standing_rules=_effective_rules,
@@ -3115,13 +4576,74 @@ def api_chat_stream():
                              tool_result_preview=_tool_result_str[:4000],
                              tool_result_chars_total=len(_tool_result_str),
                              tool_latency_ms=int((time.time() - _tool_start) * 1000))
+
+                # m116_c_instruction_misclass: memory_ingest LLM bypass on
+                # stream path. /api/chat has this bypass at line ~2323; the
+                # stream path was missing it, which caused T37
+                # ("commit this to memory - ...") to produce the
+                # "You have not asked a question" refusal even though the
+                # tool had already stored 38 facts. The LLM has nothing to
+                # add to a storage ack and its generation conflicts with
+                # the briefing/history. Hardcode the confirmation using
+                # the tool's reported count — evidence-based, not
+                # fabricated (satisfies Stream A confabulation guard).
+                if tool_name == "memory_ingest":
+                    _extracted = 0
+                    if isinstance(tool_result, dict):
+                        _extracted = tool_result.get("extracted", 0)
+                    if _extracted > 0:
+                        _ack = (f"Got it. Stored {_extracted} fact"
+                                f"{'s' if _extracted != 1 else ''}.")
+                    else:
+                        _ack = "Got it. Noted."
+                    # Yield ack as a single SSE token then finish.
+                    yield f"data: {json.dumps({'type':'token','content':_ack})}\n\n"
+                    # Update history, record turn, emit done event.
+                    _all_user_queries.append(message)
+                    _history.append({"role": "user", "content": message})
+                    _history.append({"role": "assistant", "content": _ack})
+                    _history = _trim_history(_history, MAX_HISTORY)
+                    _turn_record("generation",
+                                 response_text=_ack,
+                                 response_chars=len(_ack),
+                                 response_tokens_est=_rough_tokens(_ack),
+                                 ttft_ms=0, total_ms=0,
+                                 bypass="memory_ingest_m116_c")
+                    _turn_write()
+                    yield f"data: {json.dumps({'type':'done','stats':{},'memories_recalled':0})}\n\n"
+                    return
+                # M113 gamma: two-regime recall-quality gate.
+                # M108 Finding 2: when a tool_result is present the
+                # assembler defaults to the contracted regime
+                # (history[-4:] = last 2 pairs). T30/T31 failed because
+                # the follow-up query needed T25 context but T25 was
+                # structurally evicted AND memory_recall returned only
+                # low-score off-topic hits (0.268/0.152, both <0.4).
+                # Threshold 0.4 sits below absence-gate strict (0.7)
+                # and normal (0.5), above loose (0.3), and cleanly
+                # separates the T30/T31 miss scores (0.268/0.152) from
+                # the borderline 0.462 data point. When triggered, flip
+                # to expanded-regime history walk so prior turns are
+                # restored; the tool_result tail is still appended, so
+                # tool grounding is preserved — this only widens
+                # conversation history.
+                _m113_gamma_low_recall = bool(
+                    _recall_score_max_for_log < 0.4)
+                _turn_record("assembly",
+                             regime_gate_m113_gamma={
+                                 "recall_max_score": round(
+                                     _recall_score_max_for_log, 3),
+                                 "threshold": 0.4,
+                                 "flipped_to_expanded": _m113_gamma_low_recall,
+                             })
                 msgs = build_messages(
-                    _history, augmented,
+                    _history_for_prompt, augmented,
                     tool_name=tool_name,
                     tool_args=tool_args, tool_result=tool_result,
                     memory_context=mem_ctx,
                     briefing=presentation_briefing,
                     standing_rules=_effective_rules,
+                    expand_history_on_low_recall=_m113_gamma_low_recall,
                 )
 
             # Prefill token estimate from the actual msgs list that will be
@@ -3132,8 +4654,13 @@ def api_chat_stream():
                     _prefill_tokens_est += _rough_tokens(_m.get("content", "") or "")
             except Exception:
                 pass
+            # m109_zeta_field_6: per-message source_turn provenance tags.
+            # System slot → 'system' or 'briefing', current user → 'T<N>',
+            # prior history → 'T<N-k>' paired by (user, assistant) pairs.
+            _m109_tagged_msgs = _m109_tag_history_messages(
+                msgs, briefing_present=bool(presentation_briefing))
             _turn_record("assembled_prompt",
-                         messages=[{"role": _m.get("role", ""), "content": _m.get("content", "")} for _m in msgs],
+                         messages=_m109_tagged_msgs,
                          total_chars=sum(len(_m.get("content", "") or "") for _m in msgs),
                          total_tokens_est=_prefill_tokens_est,
                          role_structure=[_m.get("role", "") for _m in msgs],
@@ -3170,37 +4697,62 @@ def api_chat_stream():
             _first_token_ts = None
             full_response = []
             _loop_window = ""  # Main 42: streaming loop detector
+            # m109_zeta_field_4: track stop cause for midas-side inference.
+            # 72B server always emits finish_reason='stop' so we must
+            # reconstruct cause from tokens_decoded + max_tokens + flags.
+            _m109_loop_broke = False
+            _m109_gen_error = None
             # M73 P1.5 Agent 3: plumb full sample_profile to llm_stream.
             # Server now honors temperature + repetition_penalty + min_p + top_p.
             _m73_sp = _m73_dispatch["sample_profile"]
+            # m113_delta_denial_streak: when two or more prior-assistant turns
+            # in the recent window match α's abstain-reinforcement shape,
+            # reduce temperature and repetition_penalty for THIS turn so the
+            # sampler stops amplifying the denial streak. Import-guarded; any
+            # failure falls open to the base profile.
+            _m113_delta_telemetry = None
+            try:
+                from denial_streak_sampler import maybe_override_sample_profile
+                _m73_sp, _m113_delta_telemetry = maybe_override_sample_profile(
+                    _m73_sp, _history)
+            except Exception as _dserr:
+                print(f"[m113_delta] override import/run failed, using base profile: {_dserr}")
+            if _m113_delta_telemetry is not None:
+                _turn_record("sampler_streak_override", **_m113_delta_telemetry)
             _m73_temperature = float(_m73_sp["temperature"])
             if mem_ctx and _m73_temperature > 0.3:
                 _m73_temperature = 0.3
             _m73_rep_penalty = float(_m73_sp.get("repetition_penalty", 1.0))
             _m73_min_p = float(_m73_sp.get("min_p", 0.0))
-            for chunk in llm_stream(msgs, max_tokens=_stream_max_tokens,
-                                    temperature=_m73_temperature,
-                                    repetition_penalty=_m73_rep_penalty,
-                                    min_p=_m73_min_p):
-                if _first_token_ts is None:
-                    _first_token_ts = time.time()
-                full_response.append(chunk)
-                sse_data = json.dumps({"type": "token", "content": chunk})
-                yield f"data: {sse_data}\n\n"
-                # Main 42: detect n-gram drafter loops in-flight.
-                # Check last 200 chars for a repeating pattern.
-                _loop_window += chunk
-                if len(_loop_window) > 200:
-                    _tail = _loop_window[-200:]
-                    # Find any 6-30 char substring that repeats 4+ times
-                    _looping = False
-                    for _plen in range(6, 31):
-                        _pat = _tail[-_plen:]
-                        if _tail.count(_pat) >= 4:
-                            _looping = True
-                            break
-                    if _looping:
-                        break  # stop generation, let _clean_response trim
+            try:
+                for chunk in llm_stream(msgs, max_tokens=_stream_max_tokens,
+                                        temperature=_m73_temperature,
+                                        repetition_penalty=_m73_rep_penalty,
+                                        min_p=_m73_min_p):
+                    if _first_token_ts is None:
+                        _first_token_ts = time.time()
+                    full_response.append(chunk)
+                    sse_data = json.dumps({"type": "token", "content": chunk})
+                    yield f"data: {sse_data}\n\n"
+                    # Main 42: detect n-gram drafter loops in-flight.
+                    # Check last 200 chars for a repeating pattern.
+                    _loop_window += chunk
+                    if len(_loop_window) > 200:
+                        _tail = _loop_window[-200:]
+                        # Find any 6-30 char substring that repeats 4+ times
+                        _looping = False
+                        for _plen in range(6, 31):
+                            _pat = _tail[-_plen:]
+                            if _tail.count(_pat) >= 4:
+                                _looping = True
+                                break
+                        if _looping:
+                            _m109_loop_broke = True  # m109_zeta_field_4
+                            break  # stop generation, let _clean_response trim
+            except Exception as _gerr:
+                _m109_gen_error = str(_gerr)[:200]  # m109_zeta_field_4
+                # Do not re-raise — preserve existing behavior where the
+                # request still completes with whatever tokens we captured.
             _gen_end = time.time()
 
             # M50 P1: check if CPU maintenance completed during decode.
@@ -3230,9 +4782,32 @@ def api_chat_stream():
                         "tools_called", [])
                     if isinstance(_tools_called, str):
                         _tools_called = [_tools_called]
-                    _scrub_result = _scrub_fn(response, _gc,
-                                              user_query=message,
-                                              tools_called=_tools_called)
+                    # M125.3 Stream B P2: pass canonical_atom rows from
+                    # retrieved context to scrub so the relevance gate
+                    # can protect grounded content. Pull from the
+                    # recall_filtered snapshot already emitted into
+                    # _TURN_LOG.retrieval (persisted pre-scrub).
+                    _m125_3_b_canonical_atoms = []
+                    try:
+                        _rf = (_TURN_LOG.get("retrieval", {}) or {}).get(
+                            "recall_filtered", []) or []
+                        for _r in _rf:
+                            _rtype = (_r.get("type") or "").lower()
+                            if _rtype == "canonical_atom":
+                                _m125_3_b_canonical_atoms.append({
+                                    "id": _r.get("id", ""),
+                                    "text": _r.get("text", ""),
+                                    "type": _rtype,
+                                    "source_role": _r.get(
+                                        "source_role", ""),
+                                })
+                    except Exception:
+                        _m125_3_b_canonical_atoms = []
+                    _scrub_result = _scrub_fn(
+                        response, _gc,
+                        user_query=message,
+                        tools_called=_tools_called,
+                        canonical_atoms=_m125_3_b_canonical_atoms)
                     if _scrub_result and _scrub_result["total_flags"] > 0:
                         cleaned = _scrub_result["cleaned_response"]
                         if cleaned is None:
@@ -3248,6 +4823,77 @@ def api_chat_stream():
                 except Exception as _scrub_err:
                     # Scrub must never break the response path
                     print(f"[scrub] error: {_scrub_err}", flush=True)
+
+            # m116_a_confab_guard: post-scrub grounding-signal join.
+            # Consumes (content, retrieval_hits, tool_calls_made,
+            # grounded_memory). Shape (a) REPLACE per directive §3.1 —
+            # chosen for M117 pilot attribution clarity (shape (c)
+            # telemetry-only would muddy signal). See
+            # confabulation_shape_detector.py for the three signals.
+            _confab_diag = None
+            if response:  # m116_a_confab_guard
+                try:
+                    from confabulation_shape_detector import (  # m116_a_confab_guard
+                        apply_confabulation_guard as _confab_guard_fn,
+                        ABSTAIN_MESSAGE as _CONFAB_ABSTAIN,
+                    )
+                    if response == _CONFAB_ABSTAIN:
+                        # Already-abstained upstream; skip.
+                        raise RuntimeError("already abstained")
+                    _confab_tools = _TURN_LOG.get("routing", {}).get(
+                        "tools_called", [])  # m116_a_confab_guard
+                    if isinstance(_confab_tools, str):
+                        _confab_tools = [_confab_tools]
+                    _confab_retrieval = _TURN_LOG.get("retrieval", {}).get(
+                        "recall_filtered", []) or []  # m116_a_confab_guard
+                    _confab_grounded = (
+                        mem_ctx if isinstance(mem_ctx, list)
+                        else ([mem_ctx] if mem_ctx else []))  # m116_a_confab_guard
+                    # m118_d_referent_binding: pull the prior assistant
+                    # turn text so Signal 4 can resolve demonstratives
+                    # ("this classifier") to an antecedent entity from
+                    # the last turn. _history has NOT yet been appended
+                    # with the current user/assistant pair at this point
+                    # (see appends at lines ~4079/4080), so _history[-1]
+                    # is the prior assistant turn when available.
+                    _prior_turn_content = ""  # m118_d_referent_binding
+                    try:
+                        for _h in reversed(_history):
+                            if _h.get("role") == "assistant":
+                                _prior_turn_content = _h.get("content", "") or ""
+                                break
+                    except Exception:
+                        _prior_turn_content = ""
+                    _guarded, _confab_diag = _confab_guard_fn(
+                        response,
+                        retrieval_hits=_confab_retrieval,
+                        tool_calls_made=_confab_tools,
+                        grounded_memory=_confab_grounded,
+                        prior_turn_content=_prior_turn_content,  # m118_d_referent_binding
+                        user_query=message,                      # m118_d_referent_binding
+                    )  # m116_a_confab_guard
+                    if _confab_diag and _confab_diag.get("verdict"):
+                        print(
+                            f"[m116_a_confab_guard] FIRED signals="
+                            f"S1={_confab_diag['signal_1_fired']} "
+                            f"S2={_confab_diag['signal_2_fired']} "
+                            f"S3={_confab_diag['signal_3_fired']} "
+                            f"S4={_confab_diag.get('signal_4_fired', False)} "
+                            f"phrases={_confab_diag['matched_phrases'][:5]}",
+                            flush=True,
+                        )
+                        if _guarded != response:
+                            response = _guarded
+                            yield (
+                                f"data: {json.dumps({'type':'confab_guard','content':_guarded})}\n\n"
+                            )
+                except Exception as _confab_err:  # m116_a_confab_guard
+                    # Guard must never break the response path
+                    if str(_confab_err) != "already abstained":
+                        print(
+                            f"[m116_a_confab_guard] error: {_confab_err}",
+                            flush=True,
+                        )
 
             # --- inference telemetry derivations ---
             _stats = _last_stats or {}
@@ -3288,6 +4934,15 @@ def api_chat_stream():
                 _drafts_per_accept = round(
                     _ngram_drafted / _ngram_accepted, 2)
 
+            # m109_zeta_field_4: infer stop_reason from captured signals.
+            # 72B server always emits finish_reason='stop' so we reconstruct
+            # cause offline: loop_detected > verifier_error > max_tokens > eos.
+            _m109_stop_reason = _m109_infer_stop_reason(
+                tokens_decoded=_tokens_decoded,
+                max_tokens=_stream_max_tokens,
+                loop_detected=_m109_loop_broke,
+                gen_error=_m109_gen_error,
+                user_cancel=False)  # user_cancel not plumbed in stream path
             _turn_record(
                 "generation",
                 generation_started_ts=_gen_start,
@@ -3321,6 +4976,18 @@ def api_chat_stream():
                 response_text=response,
                 response_chars=len(response),
                 response_tokens_est=_rough_tokens(response),
+                stop_reason=_m109_stop_reason,  # m109_zeta_field_4
+                stop_reason_max_tokens_cap=_stream_max_tokens,  # m109_zeta_field_4
+                stop_reason_loop_broke=_m109_loop_broke,  # m109_zeta_field_4
+                stop_reason_gen_error=_m109_gen_error,  # m109_zeta_field_4
+                # m123_a2_completion_reason: ζ v2.2 extension per M123
+                # Stream A2. Additive enum derived from M109 stop_reason;
+                # discriminates stream-terminated (truncation-class)
+                # completions from natural EOS. Backward-compatible — old
+                # consumers keep using stop_reason; new consumers get the
+                # coarser, observably-stable enum.
+                completion_reason=_m123_a2_completion_reason(
+                    _m109_stop_reason),
             )
 
             # Update history
@@ -3399,7 +5066,11 @@ def api_chat_stream():
                          stale_entities_in_response=_detect_stale_entities(response),
                          stale_entities_in_context=_detect_stale_entities(_ctx_blob),
                          tools_requested_not_called=_TURN_LOG.get(
-                             "routing", {}).get("tools_requested_not_called", []))
+                             "routing", {}).get("tools_requested_not_called", []),
+                         # m109_zeta_field_2: populate grounded with gate state
+                         # rather than leaving null. Tier 1 is disabled for
+                         # Gemma 4 per answer_scrub.py:41.
+                         grounded=_m109_grounding_state())
 
             # Post-turn: memory store total, turn complete.
             # M89 fix: _ai_result doesn't exist in streaming path (NameError was
@@ -3411,26 +5082,108 @@ def api_chat_stream():
                 _cur_total = _mstats.get("total_memories") or 0
                 _stored_delta = max(0, _cur_total - (_prev_memory_store_total or _cur_total))
                 _prev_memory_store_total = _cur_total
+                # m109_zeta_field_3: per-memory manifest. Preserve backward
+                # compat by keeping `memories_stored_this_turn` as the count
+                # (int) AND adding a parallel `memories_stored_this_turn_manifest`
+                # list. Existing parsers that read `memories_stored_this_turn`
+                # as an int continue to work; new parsers can consume the
+                # manifest field. Approach chosen: sibling field (not nested).
+                _m109_manifest = _m109_memory_manifest(_stored_delta)
                 _turn_record("post_turn",
                              memory_store_total=_cur_total,
-                             memories_stored_this_turn=_stored_delta)
+                             memories_stored_this_turn=_stored_delta,
+                             memories_stored_this_turn_manifest=_m109_manifest)
             except Exception as _e:
                 _turn_record("post_turn", memory_store_total=None,
                              memories_stored_this_turn=0,
+                             memories_stored_this_turn_manifest=[],
                              post_turn_error=str(_e)[:100])
 
             # Main 46: log scrub results
+            # M120 C: add tier2_conflict_flagged (registry-value conflicts).
+            # m122_a3_zeta_v22: tier2_binding.skip_reason stub (A2 will populate
+            # the semantics). Emit only when there is signal to report —
+            # additive + optional per Pattern-1 guardrail. A2 will wire the
+            # bare-scalar-guard + abstention-pattern outputs through scrub_response
+            # and populate the per-evaluation skip_reason list; until then this
+            # carries an empty list so consumers never KeyError.
             if _scrub_result:
+                _tier2_skip_reasons = _scrub_result.get(
+                    "tier2_binding_skip_reasons", [])  # m122_a3_zeta_v22
+                _scrub_fields = dict(
+                    tier1_flags=_scrub_result.get("tier1_flags", []),
+                    tier2_flags=_scrub_result.get("tier2_flags", []),
+                    tier2_conflict_flagged=_scrub_result.get("tier2_conflict_flagged", []),
+                    total_flags=_scrub_result.get("total_flags", 0),
+                    sentences_stripped=_scrub_result.get("sentences_stripped", 0),
+                    latency_ms=_scrub_result.get("latency_ms", 0),
+                    original_response_chars=_scrub_result.get("original_response_chars", 0),
+                    cleaned_response_chars=_scrub_result.get("cleaned_response_chars", 0),
+                    # M125.3 Stream B P1: scrub-tier attribution.
+                    # Closes the Phase 0 gap where total_flags>0 but
+                    # tier1/tier2/tier2_conflict arrays were all empty.
+                    tier0_flags=_scrub_result.get("tier0_flags", []),
+                    tier2_narrative_flags=_scrub_result.get(
+                        "tier2_narrative_flags", []),
+                    tier2_narrative_verdict=_scrub_result.get(
+                        "tier2_narrative_verdict", "PASS"),
+                    tier3_flags=_scrub_result.get("tier3_flags", []),
+                    narrative_overstrip_triggered=_scrub_result.get(
+                        "narrative_overstrip_triggered", False),
+                    scrub_mechanism_fired=_scrub_result.get(
+                        "scrub_mechanism_fired", []),
+                    # M125.3 Stream B P1: pre-gate tier list — which
+                    # tier would have fired absent the P2 relevance gate.
+                    scrub_mechanism_pre_gate=_scrub_result.get(
+                        "scrub_mechanism_pre_gate", []),
+                    # M125.3 Stream B P1 pre-gate attribution counts.
+                    tier1_flags_pre_gate_count=_scrub_result.get(
+                        "tier1_flags_pre_gate_count", 0),
+                    tier2_flags_pre_gate_count=_scrub_result.get(
+                        "tier2_flags_pre_gate_count", 0),
+                    tier2_narrative_flags_pre_gate_count=_scrub_result.get(
+                        "tier2_narrative_flags_pre_gate_count", 0),
+                    tier3_flags_pre_gate_count=_scrub_result.get(
+                        "tier3_flags_pre_gate_count", 0),
+                    # M125.3 Stream B P2: scrub-relevance gate state.
+                    canonical_atom_skip_count=_scrub_result.get(
+                        "canonical_atom_skip_count", 0),
+                    canonical_atoms_considered=_scrub_result.get(
+                        "canonical_atoms_considered", 0),
+                )
+                # Emit canonical_atom_skips detail only when non-empty
+                # (keeps turn JSON lean on the common path).
+                _m125_3_skips = _scrub_result.get(
+                    "canonical_atom_skips", []) or []
+                if _m125_3_skips:
+                    _scrub_fields["canonical_atom_skips"] = _m125_3_skips
+                if _tier2_skip_reasons:  # m122_a3_zeta_v22 — emit only when non-empty
+                    _scrub_fields["tier2_binding"] = {
+                        "skip_reason": _tier2_skip_reasons,
+                    }
+                _turn_record("scrub", **_scrub_fields)
+
+            # m122_a3_zeta_v22: confab_guard_diagnostic — per-signal firing
+            # state from confabulation_shape_detector. Distinguishes
+            # "guard ran + passed" from "guard didn't run" from
+            # "guard ran + fired". Emit only when guard was invoked
+            # (i.e. _confab_diag is not None).
+            if _confab_diag is not None:  # m122_a3_zeta_v22
                 _turn_record("scrub",
-                             tier1_flags=_scrub_result.get("tier1_flags", []),
-                             tier2_flags=_scrub_result.get("tier2_flags", []),
-                             total_flags=_scrub_result.get("total_flags", 0),
-                             sentences_stripped=_scrub_result.get("sentences_stripped", 0),
-                             latency_ms=_scrub_result.get("latency_ms", 0),
-                             original_response_chars=_scrub_result.get("original_response_chars", 0),
-                             cleaned_response_chars=_scrub_result.get("cleaned_response_chars", 0))
+                             confab_guard_diagnostic={
+                                 "signal_1_fired": bool(_confab_diag.get("signal_1_fired", False)),
+                                 "signal_2_fired": bool(_confab_diag.get("signal_2_fired", False)),
+                                 "signal_3_fired": bool(_confab_diag.get("signal_3_fired", False)),
+                                 "signal_4_fired": bool(_confab_diag.get("signal_4_fired", False)),
+                                 "match_text_per_signal": _confab_diag.get("matched_phrases", [])[:20],
+                                 "verdict": bool(_confab_diag.get("verdict", False)),
+                             })
 
             _turn_write()
+
+            # M125 A5.1: stash tool dispatched this turn for next-turn
+            # anaphoric / subject-continuity fold-in.
+            _last_tool = tool_name or ""
 
             # Schedule idle
             if _idle_queue and response:
@@ -3482,6 +5235,107 @@ def api_health_system():
         snapshot["_warning"] = "probe heartbeat >15 min stale; probe itself may have failed"
         return jsonify(snapshot), 503
     return jsonify(snapshot)
+
+
+@app.route("/health/trajectory")
+def api_health_trajectory():
+    """M98 Stage 2 Agent 2e — operator-facing trajectory surface.
+
+    Returns the last 60 trajectory records (60 min at 60s cadence) from
+    data/system_health/trajectory.jsonl, the latest delta record (all windows)
+    from deltas.jsonl, and the current v2 probe snapshot from latest.json.
+
+    Graceful degradation: if trajectory.jsonl or deltas.jsonl do not yet exist
+    (2c / 2d still running or not yet shipped), return empty arrays with
+    status=awaiting_data rather than 5xx. latest.json is expected to exist
+    (probe has been live since M83); if absent we still return 200 with
+    snapshot=None and status=awaiting_probe.
+
+    Format: JSON-RPC style (not HTML). This endpoint is operator tooling +
+    dashboard source, not a server-rendered page.
+    """
+    base = Path("/Users/midas/Desktop/cowork/data/system_health")
+    trajectory_path = base / "trajectory.jsonl"
+    deltas_path = base / "deltas.jsonl"
+    latest_path = base / "latest.json"
+
+    out = {
+        "status": "ok",
+        "served_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "trajectory": [],
+        "trajectory_count": 0,
+        "latest_delta": None,
+        "snapshot": None,
+        "sources": {
+            "trajectory": str(trajectory_path),
+            "deltas": str(deltas_path),
+            "snapshot": str(latest_path),
+        },
+        "awaiting": [],
+    }
+
+    # ── Trajectory: last 60 records ──
+    if trajectory_path.exists():
+        try:
+            # Efficient tail-read: slurp lines, keep last 60
+            with trajectory_path.open("r") as fh:
+                lines = fh.readlines()
+            tail = lines[-60:] if len(lines) > 60 else lines
+            records = []
+            for line in tail:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except Exception:
+                    # Skip malformed lines; don't fail the whole endpoint
+                    continue
+            out["trajectory"] = records
+            out["trajectory_count"] = len(records)
+        except Exception as e:
+            out["trajectory_error"] = str(e)[:200]
+            out["awaiting"].append("trajectory")
+    else:
+        out["awaiting"].append("trajectory")
+
+    # ── Deltas: latest record (all windows) ──
+    if deltas_path.exists():
+        try:
+            with deltas_path.open("r") as fh:
+                lines = fh.readlines()
+            # Find last non-empty JSON line
+            for line in reversed(lines):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out["latest_delta"] = json.loads(line)
+                    break
+                except Exception:
+                    continue
+            if out["latest_delta"] is None:
+                out["awaiting"].append("deltas")
+        except Exception as e:
+            out["deltas_error"] = str(e)[:200]
+            out["awaiting"].append("deltas")
+    else:
+        out["awaiting"].append("deltas")
+
+    # ── Snapshot: current probe reading ──
+    if latest_path.exists():
+        try:
+            out["snapshot"] = json.loads(latest_path.read_text())
+        except Exception as e:
+            out["snapshot_error"] = str(e)[:200]
+            out["awaiting"].append("snapshot")
+    else:
+        out["awaiting"].append("snapshot")
+
+    if out["awaiting"]:
+        out["status"] = "awaiting_data"
+
+    return jsonify(out)
 
 
 @app.route("/api/subconscious/health")
@@ -3648,7 +5502,6 @@ def api_session_context():
                         ("subconscious", "subconscious"),
                         ("memory", "subconscious"),
                         ("paper", "paper"), ("locomo", "paper"),
-                        ("cen", "cen"), ("isda", "cen"),
                     ):
                         if kw in q:
                             topic_counts[tag] = topic_counts.get(tag, 0) + 1
@@ -4468,10 +6321,17 @@ def _boot_consistency_check() -> list:
                                "orion-ane/memory/chromadb_live/memory_local.db")
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
 
-        # Check key canonical entries for contradictions
+        # Check key canonical entries for contradictions.
+        # M103: mirror of M102 narrative_retrieval fix. Some registry entries
+        # are bare scalars (float/bool/str) written by pipeline tools (e.g.
+        # tools/m96/m96_analyze.py) that bypass the dict schema. Skip them
+        # here so a single malformed row can't trigger the boot CHECK_ERROR
+        # `'float' object has no attribute 'get'`. Root cause + full catalog
+        # in vault/agent_reports/m102_narrative_retrieval_fix.md.
         check_entries = [
             k for k, v in reg.items()
-            if v.get("status") == "canonical"
+            if isinstance(v, dict)
+            and v.get("status") == "canonical"
             and v.get("value")
             and str(v["value"]).replace("+", "").replace("-", "").replace("<", "").replace("%", "").strip().replace(".", "").isdigit()
         ]

@@ -8,7 +8,7 @@ with the CPU FactExtractor regex patterns and (b) actively hurt
 LoCoMo where conversational extraction is needed.
 
 The new prompt:
-  - Domain-agnostic (no Apple Silicon, no ISDA, no specific vocabulary)
+  - Domain-agnostic (no Apple Silicon, no domain jargon, no specific vocabulary)
   - 8 categories: fact, speculation, correction, decision, preference,
     plan, relationship, context
   - Asks for confidence level + speaker + topic on every extraction

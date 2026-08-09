@@ -51,11 +51,11 @@ daemon = MemoryDaemon(
 daemon.start()
 
 # Ingest conversation turns
-daemon.ingest("user", "We agreed to set the cross-default threshold at $75M for Counterparty Alpha")
-daemon.ingest("assistant", "Noted. That's higher than the $50M standard for BBB+ entities.")
+daemon.ingest("user", "We agreed to set the cache eviction threshold at 75GB for Cluster Alpha")
+daemon.ingest("assistant", "Noted. That's higher than the 50GB standard for tier-2 clusters.")
 
 # Semantic recall
-results = daemon.recall("cross-default thresholds")
+results = daemon.recall("eviction thresholds")
 
 # One-shot enrichment (run all sweeps once, then exit)
 daemon.enrich_once()
@@ -100,15 +100,15 @@ What Phantom produces overnight while your LLM is idle:
 # ◈ Phantom Insights — 2026-03-18
 
 ## Threshold Inconsistencies
-- Counterparty Alpha: $75M cross-default (BBB+)
-- Counterparty Beta: $50M cross-default (BBB+)
-- Same rating, 50% threshold difference. Intentional?
+- Cluster Alpha: 75GB eviction (tier-2)
+- Cluster Beta: 50GB eviction (tier-2)
+- Same tier, 50% threshold difference. Intentional?
 
 ## Stale Items
 - "Draft counter-proposal by Friday" (from March 14) — likely past
 
 ## Entity Summaries Updated
-- Counterparty Alpha: 47 facts → 5-line profile (updated overnight)
+- Cluster Alpha: 47 facts → 5-line profile (updated overnight)
 ```
 
 ### ANE-ready architecture

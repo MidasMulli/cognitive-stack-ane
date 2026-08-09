@@ -33,3 +33,20 @@ phantom_memory
 # ChromaDB data
 chromadb*/
 memory_store/
+
+# ── TRACK SEPARATION GATE ─────────────────────────────────────────────────────
+# These four files carry application-domain content that does not belong in this
+# public repo. They are untracked today; without these entries a routine
+# `git add .` would publish them. One of them quotes a specific third-party
+# document that is not public anywhere.
+# A rule in a comment is documentation; these lines are the gate.
+agent/anaphor_resolver.py
+agent/confabulation_shape_detector.py
+tests/test_m118_d_referent_binding.py
+tests/test_m118_e_canonical_retrieval_miss.py
+
+# graphify-out/ — code-graph BUILD CACHE, ~94 MB, untracked in all 12 repos.
+# Also a track-separation hazard by a side door: it INDEXES THE SOURCES, so it
+# can carry the content of the four gated files above. Gating the sources does
+# not gate their index.
+graphify-out/

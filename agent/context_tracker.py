@@ -60,11 +60,6 @@ DEFAULT_TOPIC_KEYWORDS = {
         "reviewer", "methodology", "citation", "thesis", "m1", "m2",
         "m5", "m6", "locomo", "gold set",
     ],
-    "cen_derivatives": [
-        "cen", "isda", "csa", "collateral", "derivative", "swap",
-        "var", "risk", "trade lifecycle", "haircut", "margin",
-        "repo", "libor", "sofr",
-    ],
     "strategic_planning": [
         "plan", "strateg", "priorit", "roadmap", "next session",
         "decision", "directive", "main ", "kill test", "commit",

@@ -123,7 +123,7 @@ def memory_recall(query: str, n_results: int = 5, type_filter: str = "",
     when the user references something from a previous session.
 
     Args:
-        query: Natural language search query (e.g. "cross-default threshold for Counterparty X")
+        query: Natural language search query (e.g. "eviction threshold for Cluster X")
         n_results: Number of results to return (default 5, max 20)
         type_filter: Optional — filter by fact type: "decision", "task", "preference", "quantitative", "general"
         include_superseded: If True, include old/contradicted facts (default False)
