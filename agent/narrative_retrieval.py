@@ -199,7 +199,14 @@ def _registry_lookup(query: str) -> str | None:
     matches = []
     seen = set()
 
+    # M102: some registry entries are bare scalars (float/bool/str) written
+    # by pipeline tools (e.g. tools/m96/m96_analyze.py) that bypass the
+    # dict schema. Skip them here so a single malformed row can't abort
+    # the whole factual-intent path. Root cause + full catalog in
+    # vault/agent_reports/m102_narrative_retrieval_fix.md.
     for key, entry in registry.items():
+        if not isinstance(entry, dict):
+            continue
         for alias in entry.get("aliases", []):
             if alias.lower() in ql:
                 if key not in seen:
@@ -355,6 +362,13 @@ def try_narrative_context(query: str, corpus_dir: str = None,
 
         thread = _thread_detector(query, corpus, top_n=max_records)
 
+        # M102: drop non-dict thread elements defensively. detect_thread()
+        # always returns dicts today, but every downstream consumer here
+        # assumes a dict shape via .get(); one bare-scalar element would
+        # abort the whole path. Filter once at the boundary rather than
+        # sprinkling isinstance() checks at every read site.
+        thread = [r for r in thread if isinstance(r, dict)]
+
         if len(thread) < min_records:
             return None
 
@@ -383,7 +397,12 @@ def try_narrative_context(query: str, corpus_dir: str = None,
         # actually addresses. Below threshold: thread is too weakly tied
         # to the query, fall through to default_recall. Calibrated on the
         # M92 baseline — see header comment.
-        top_score = thread[0].get("score", 0) if thread else 0
+        # M102: defensive — thread[0] is always a dict from detect_thread()
+        # today, but guard against future shape drift (see
+        # vault/agent_reports/m102_narrative_retrieval_fix.md).
+        top_score = (thread[0].get("score", 0)
+                     if thread and isinstance(thread[0], dict)
+                     else 0)
         if top_score < _M97_MIN_TOP_SCORE or query_match_ratio < _M97_MIN_QUERY_MATCH_RATIO:
             return None
 

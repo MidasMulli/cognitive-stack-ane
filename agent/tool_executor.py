@@ -14,6 +14,19 @@ import subprocess
 import sys
 from datetime import datetime
 
+# M100 Agent A1 (class 3 query-side vocabulary normalization). Shared alias
+# + rare-token helpers live in query_vocab so LocalMemoryStore and the
+# vault-read/vault_research keyword scorers agree on vocabulary bridges.
+# Directive: vault/directives/in_progress/2026-04-20T23-27-15_m100open_
+# m100-quality-fixes-class-3-2-registry.md §2.1.
+try:  # pragma: no cover — package layout varies at import time
+    from agent import query_vocab  # type: ignore
+except Exception:
+    try:
+        from . import query_vocab  # type: ignore
+    except Exception:
+        import query_vocab  # type: ignore
+
 # ── Dependencies from existing agent infrastructure ──────────────────────────
 
 VAULT_PATH = "/Users/midas/Desktop/cowork/vault"
@@ -245,11 +258,24 @@ def _vault_read(path: str = "", query: str = "") -> dict:
             'out', 'off', 'list', 'explain', 'describe', 'tell',
             'show', 'give', 'me', 'us', 'you', 'your', 'my',
         }
-        # Keep numbers (even short ones like "38") and meaningful words
-        query_words = [w.lower() for w in query.split()
-                       if w.lower() not in _STOP and len(w) > 0]
+        # Keep numbers (even short ones like "38") and meaningful words.
+        # M100 A1: strip trailing punctuation before stopword check so
+        # "SME?" lands as "sme" rather than a literal "sme?" that never
+        # matches content-lowercase hits.
+        raw_tokens = [query_vocab.strip_query_punct(w) for w in query.split()]
+        query_words = [w for w in raw_tokens if w and w not in _STOP]
         if not query_words:
-            query_words = [w.lower() for w in query.split()[:4]]
+            query_words = [w for w in raw_tokens[:4] if w]
+        # M100 A1: alias expansion — "paper 2" → "five roadblocks", "enclave"
+        # → "exclave", "op codes" → "opcodes".  Keeps originals.  Pass the
+        # raw query so multi-token aliases ("paper 2", "op codes") survive
+        # stop-word stripping.
+        query_words = query_vocab.expand_query_terms(query_words,
+                                                     raw_query=query)
+        # M100 A1: canonical-file hints — certain queries name a single
+        # canonical file; force that file into top-N regardless of
+        # keyword density elsewhere.
+        _hint_paths = set(query_vocab.canonical_file_hints(query))
 
         matches = []
         for md_file in globmod.glob(os.path.join(VAULT_PATH, "**/*.md"), recursive=True):
@@ -286,16 +312,50 @@ def _vault_read(path: str = "", query: str = "") -> dict:
                 fn_hits = sum(1 for w in query_words if len(w) > 1 and w in _fn_base)
                 if fn_hits:
                     score += fn_hits * 5
+                # M100 A1: rare-token bonus.  "SME", "smopa", "0x9141",
+                # "roadblocks" etc. are high-signal — if they appear in
+                # the file, that file is almost certainly topical.  Base
+                # bonus per unique rare token + occurrence-count component
+                # (capped) so canonical files with dozens of mentions
+                # beat tangential single-mention files.
+                score += query_vocab.rare_token_score(query_words, content_lower)
+                # M100 A1: canonical-file-hint bonus.  Forces the named
+                # file (e.g. five_roadblocks_personal_ai.md for "Paper 2")
+                # into the top-N regardless of how word-dense alternatives
+                # are.  Only fires when a query-level alias trigger has
+                # identified THIS specific file as the canonical answer.
+                if rel in _hint_paths:
+                    score += query_vocab.CANONICAL_FILE_HINT_BONUS
                 lines = content.split("\n")
-                snippets = []
+                # M100 A1: collect snippets with per-snippet scoring so
+                # we can rank "exclave"-matching lines ahead of generic
+                # "ane"-matching lines inside the same file. Without
+                # this, ane_hardware.md returns its title line 5 times
+                # and the actual exclave content on line 17 never makes
+                # the top-5 cutoff.
+                _scored_snippets: list[tuple[int, str]] = []
                 for i, line in enumerate(lines):
                     line_lower = line.lower()
-                    if any(w in line_lower for w in query_words):
-                        start = max(0, i - 2)
-                        end = min(len(lines), i + 3)
-                        snippet = "\n".join(lines[start:end]).strip()
-                        if len(snippet) > 20:
-                            snippets.append(snippet)
+                    if not any(w in line_lower for w in query_words):
+                        continue
+                    start = max(0, i - 2)
+                    end = min(len(lines), i + 3)
+                    snippet = "\n".join(lines[start:end]).strip()
+                    if len(snippet) < 20:
+                        continue
+                    sn_low = snippet.lower()
+                    # Per-snippet score: rare-token hits weighted heavily
+                    # so they float above title-only matches.
+                    sn_score = query_vocab.rare_token_score(
+                        query_words, sn_low)
+                    # Also count distinct query-word hits in the snippet
+                    # itself to break ties.
+                    sn_score += sum(1 for w in query_words if w in sn_low)
+                    _scored_snippets.append((sn_score, snippet))
+                # Sort by per-snippet score desc, then preserve original
+                # document order as tiebreak (stable sort).
+                _scored_snippets.sort(key=lambda x: -x[0])
+                snippets = [s for _, s in _scored_snippets]
                 if snippets:
                     matches.append({
                         "file": rel,
@@ -404,9 +464,18 @@ def _vault_research(query: str) -> dict:
     if not query:
         return {"error": "query required"}
 
-    query_words = [w.lower() for w in query.split() if len(w) > 2]
+    # M100 A1: strip trailing punctuation before the len>2 filter so e.g.
+    # "SME?" -> "sme" (len 3) survives.  "sme" is a 3-char rare-signal
+    # token that previously got dropped by the len>2 gate when a query
+    # question-mark was left on it.
+    raw_tokens = [query_vocab.strip_query_punct(w) for w in query.split()]
+    query_words = [w for w in raw_tokens if len(w) > 2]
     if not query_words:
         return {"error": "query too short"}
+    # M100 A1: alias expansion + rare-token boost parity with _vault_read.
+    query_words = query_vocab.expand_query_terms(query_words,
+                                                 raw_query=query)
+    _hint_paths = set(query_vocab.canonical_file_hints(query))
 
     # M54 Phase 2.4: possessive-intent detection. Distinguish CAPABILITY
     # questions ("do we have X", "is X our pipeline") from KNOWLEDGE
@@ -430,12 +499,20 @@ def _vault_research(query: str) -> dict:
     # don't downweight external research even if "our" appears.
     possessive = has_capability and not has_knowledge
 
-    # Search deep research directories that vault_read skips
+    # Search deep research directories that vault_read skips.
+    # M100 A1: added `knowledge/` (for 53-opcode catalog in
+    # ane_hardware.md — M99 T31/T32 FALSE_ABSTAIN root cause) and
+    # `paper/` (for five_roadblocks_personal_ai.md — "Paper 2"
+    # M87 T07/T08 + M99 T24 FALSE_ABSTAIN root cause). Both directories
+    # are the canonical homes of the content the FALSE_ABSTAIN turns
+    # were trying to retrieve.
     search_dirs = [
         os.path.join(VAULT_PATH, "ane-reverse"),
         os.path.join(VAULT_PATH, "agent_reports"),
         os.path.join(VAULT_PATH, "slc-probe"),
         os.path.join(VAULT_PATH, "research"),
+        os.path.join(VAULT_PATH, "knowledge"),
+        os.path.join(VAULT_PATH, "paper"),
     ]
     # Also search CLAUDE_reference.md and CLAUDE_session_log.md
     extra_files = [
@@ -458,21 +535,35 @@ def _vault_research(query: str) -> dict:
                     continue
                 rel = os.path.relpath(md_file, VAULT_PATH)
                 lines = content.split("\n")
-                snippets = []
+                # M100 A1: per-snippet scoring parity with _vault_read.
+                _scored_snippets: list[tuple[int, str]] = []
                 for i, line in enumerate(lines):
                     line_lower = line.lower()
-                    if any(w in line_lower for w in query_words):
-                        start = max(0, i - 3)
-                        end = min(len(lines), i + 4)
-                        snippet = "\n".join(lines[start:end]).strip()
-                        if len(snippet) > 20:
-                            snippets.append(snippet)
+                    if not any(w in line_lower for w in query_words):
+                        continue
+                    start = max(0, i - 3)
+                    end = min(len(lines), i + 4)
+                    snippet = "\n".join(lines[start:end]).strip()
+                    if len(snippet) < 20:
+                        continue
+                    sn_low = snippet.lower()
+                    sn_score = query_vocab.rare_token_score(
+                        query_words, sn_low)
+                    sn_score += sum(1 for w in query_words if w in sn_low)
+                    _scored_snippets.append((sn_score, snippet))
+                _scored_snippets.sort(key=lambda x: -x[0])
+                snippets = [s for _, s in _scored_snippets]
                 if snippets:
                     # Score by keyword density + filename relevance bonus
                     score = sum(1 for s in snippets for w in query_words if w in s.lower())
                     # Boost files whose names match query words
                     fname_lower = os.path.basename(md_file).lower()
                     score += sum(5 for w in query_words if w in fname_lower)
+                    # M100 A1: rare-token bonus parity with _vault_read.
+                    score += query_vocab.rare_token_score(query_words, content_lower)
+                    # M100 A1: canonical-file-hint parity with _vault_read.
+                    if rel in _hint_paths:
+                        score += query_vocab.CANONICAL_FILE_HINT_BONUS
                     # M54 Phase 2.4: possessive-intent filter, tightened.
                     # Match recall-layer's 0.05x. Detect external-project
                     # content beyond research/ folder via content markers
@@ -538,6 +629,9 @@ def _vault_research(query: str) -> dict:
                         snippets.append(snippet)
             if snippets:
                 score = sum(1 for s in snippets for w in query_words if w in s.lower())
+                # M100 A1: canonical-file-hint parity.
+                if rel in _hint_paths:
+                    score += query_vocab.CANONICAL_FILE_HINT_BONUS
                 matches.append({"file": rel, "snippets": snippets[:8], "score": score})
         except Exception:
             continue

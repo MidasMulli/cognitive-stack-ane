@@ -73,8 +73,6 @@ The architecture and measurements behind this stack are documented across two pa
 
 ## Papers
 
-- **Paper 1:** "Every Cycle Counts: A Self-Correcting Cognitive Architecture on Heterogeneous Consumer Silicon" - hardware substrate and cognitive pipeline. [arXiv link TBD]
-- **Paper 2:** "Five Roadblocks to Persistent Memory for Personal AI" - memory architecture taxonomy and measured outcomes. [arXiv link TBD]
 
 ---
 

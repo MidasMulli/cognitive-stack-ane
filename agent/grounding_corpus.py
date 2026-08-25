@@ -60,7 +60,15 @@ def _load_registry_values():
         with open(reg_path) as f:
             reg = json.load(f)
         parts = []
+        # M104: mirror of M102 narrative_retrieval fix. Some registry entries
+        # are bare scalars (float/bool/str) written by pipeline tools (e.g.
+        # tools/m96/m96_analyze.py) that bypass the dict schema. Skip them
+        # here so a single malformed row can't abort grounding-corpus
+        # assembly with `'float' object has no attribute 'get'`. Root cause
+        # + full catalog in vault/agent_reports/m102_narrative_retrieval_fix.md.
         for key, entry in reg.items():
+            if not isinstance(entry, dict):
+                continue
             val = entry.get("value", "")
             unit = entry.get("unit", "")
             parts.append(f"{val} {unit}")

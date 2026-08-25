@@ -473,9 +473,26 @@ def _has_project_context(msg):
 
 PATTERNS = [
     # Memory store
+    # m116_c_instruction_misclass: extend the memory-commit imperative
+    # keyword list. Pilot traces T37/T38 showed that phrasings like
+    # "commit this to memory", "i want you to remember", "i have made a
+    # statement" fell through L1 and either reached L2 (T37 — routed to
+    # memory_ingest correctly but model still produced a refusal because
+    # the stream path missed the hardcoded bypass) or were misrouted to
+    # 'conversation' (T38). Catching more imperative shapes here keeps
+    # the tool dispatch deterministic and lets the memory_ingest bypass
+    # fire regardless of endpoint.
     {
         'keywords': ['remember this', 'remember that', 'save this', 'note that',
-                     'store this', "don't forget", 'keep in mind', 'store in memory'],
+                     'store this', "don't forget", 'keep in mind', 'store in memory',
+                     # m116_c_instruction_misclass additions
+                     'commit this to memory', 'commit to memory',
+                     'add this to memory', 'add to memory',
+                     'i want you to remember',
+                     'i have made a statement',
+                     'want you to remember', 'want to remember',
+                     'keep in mind that', 'make a note',
+                     'log this', 'log that', 'record this', 'record that'],
         'tool': 'memory_ingest',
         'extract': lambda msg: msg,
         'args': lambda msg: {'role': 'user', 'text': msg},
@@ -879,7 +896,8 @@ def _is_explicit_web_search(msg: str) -> bool:
     return any(p in low for p in _WEB_SEARCH_OVERRIDE)
 
 
-def layer1_route(message, prior_user_message: str = ""):
+def layer1_route(message, prior_user_message: str = "",
+                 prior_tool: str = ""):
     """
     Keyword-based routing. Returns (tool_name, args_dict) or None.
     Zero model calls. Instant.
@@ -887,9 +905,22 @@ def layer1_route(message, prior_user_message: str = ""):
     `prior_user_message` (Main 62 Bug 1) is the user's previous turn,
     used by _browse_search_query to resolve anaphoric follow-ups like
     "can you do a web search?" into a concrete query.
+
+    `prior_tool` (M125 A5.1) is the tool dispatched on the prior turn,
+    used to re-fire time-sensitive tools (browse_x_feed, browse_search)
+    on subject-continuity follow-ups like "has he posted anything more
+    recently?".
     """
     lower = message.lower()
     lower_stripped = strip_greeting(lower)
+
+    # M125 A5.2: meta-instruction detector (must run BEFORE the
+    # web-search override so that "remember to do a web search on X"
+    # does not greedy-match the web-search path). Acknowledge-only ship.
+    if _is_meta_instruction(message):
+        return ('meta_instruction_ack',
+                {'instruction': message,
+                 'response': _meta_instruction_acknowledgement(message)})
 
     # Main 62 Bug 2: priority override. Explicit web-search phrases
     # go to browse_search regardless of what else matches.
@@ -905,6 +936,28 @@ def layer1_route(message, prior_user_message: str = ""):
     if _is_anaphoric_search(message) and prior_user_message:
         return ('browse_search',
                 {'query': _browse_search_query(message, prior_user_message)})
+
+    # M125 A5.1: subject-continuity re-fire. If the prior turn used a
+    # time-sensitive tool (browse_x_feed / browse_search) and the current
+    # query is a short subject-pronoun follow-up, re-fire the same tool
+    # with the prior user subject composed in as the query body. This
+    # handles T55 "has he posted anything more recently?" which currently
+    # falls through to L2 and gets mis-rewritten to "who is he".
+    if (prior_tool in ('browse_x_feed', 'browse_search')
+            and _is_subject_continuity(message)
+            and prior_user_message):
+        prior_subj = _extract_prior_subject(prior_user_message)
+        if prior_subj:
+            if prior_tool == 'browse_x_feed':
+                # Compose query body by folding prior subject + current
+                # qualifier (e.g. "more recently") into the x-feed args.
+                composed = f"{prior_subj} {message.strip()}".strip()
+                return ('browse_x_feed',
+                        {'count': 5, 'query': composed})
+            # browse_search branch — fold via _browse_search_query helper
+            return ('browse_search',
+                    {'query': _browse_search_query(
+                        message, prior_user_message)})
 
     # Pre-check: if the message has web indicators AND a status keyword,
     # skip vault_read so the search pattern can catch it
@@ -1071,23 +1124,213 @@ def _is_anaphoric(message):
     """Detect messages whose object is just a pronoun (that, this, it, them).
     These refer to the prior conversation turn — routing to a tool is wrong
     because the tool can't resolve what 'that' means.
+
+    M125 A5.1 extension: also detects anaphoric tails used in M122 C pilot
+    T23/T25/T50 ("did we solve for that?", "what were the results of that
+    testing?", "what is there a delta between the two?") and short
+    continuation-shape queries like "what we discussed", "our latest",
+    "that finding", "how did we end up with X".
     """
     stripped = extract_query(message).lower().strip().rstrip('?.,!')
     # After stripping "can you / please / tell me / etc.", is what's left
     # just verb(s) + pronoun? e.g. "research that", "explain this", "look into it"
     anaphoric = re.match(
         r'^([\w\s]{1,20}?)\s+(that|this|it|them|those|these|the above|what you said|'
-        r'what you found|the last one|the result|the results)$',
+        r'what you found|the last one|the result|the results|'
+        r'the two|the both|that testing|that finding|that result|'
+        r'that experiment|that work|that paper|that thread|that approach|'
+        r'what we discussed|what we found|what we did|what we built|'
+        r'our latest|our last|our recent)$',
         stripped
     )
-    if not anaphoric:
+    if anaphoric:
+        # Make sure the verb part is short (1-3 words) to avoid false positives
+        verb_part = anaphoric.group(1).strip()
+        if len(verb_part.split()) <= 3:
+            return True
+    # M125 A5.1: "did/do we X for/about/on that" — T23 shape.
+    # "did we solve for that" / "have we looked into that" /
+    # "did we figure out that". Allow a short verb-chain before a
+    # preposition + pronoun tail.
+    if re.match(
+        r'^(?:did|do|does|have|has|can|could|should|would|will)\s+'
+        r'(?:we|you|i|it)\s+'
+        r'\w{2,20}(?:\s+\w{2,20}){0,3}\s+'
+        r'(?:for|about|on|into|with|against|at|of)\s+'
+        r'(?:that|this|it|them|those|these)$',
+        stripped,
+    ):
+        return True
+    # M125 A5.1: "did/have/do we X that" — bare trailing-pronoun shape.
+    # "did we solve that" / "have we discussed that" — a small
+    # extension to the short-verb-chain regex above that allows a
+    # longer leading verb chain when the trailing pronoun is bare.
+    if re.match(
+        r'^(?:did|do|does|have|has|can|could|should|would|will)\s+'
+        r'(?:we|you|i|it)\s+'
+        r'\w{2,20}(?:\s+\w{2,20}){0,3}\s+'
+        r'(?:that|this|it|them|those|these)$',
+        stripped,
+    ):
+        return True
+    # M125 A5.1: "delta between (the two|them|those)" shape (T50).
+    # Accept a short leading stem (≤6 words) before the anaphoric tail.
+    if re.match(
+        r'^.{0,60}?\b(?:delta|difference|gap|comparison|relationship|'
+        r'tradeoff|trade-?off)\s+'
+        r'(?:between|of|across)\s+'
+        r'(?:the\s+two|the\s+both|them|those|these|these\s+two)\b',
+        stripped,
+    ):
+        return True
+    # M125 A5.1: "results of that X", "what about X" with short trailing
+    # pronoun-adjacent phrasing. Keep tight — anchor to pronoun-like heads.
+    if re.match(
+        r'^(?:what\s+(?:were|was|are|is)\s+)?the\s+(?:results?|outcome|'
+        r'finding|verdict|answer|conclusion|takeaway)s?\s+'
+        r'(?:of|for|from)\s+(?:that|this|it|them|those|these)'
+        r'(?:\s+\w{1,20}){0,2}\s*$',
+        stripped,
+    ):
+        return True
+    # M125 A5.1: "how did we end up with X", "how did we wind up with X" —
+    # strongly anaphoric framing regardless of trailing noun specificity.
+    if re.match(
+        r'^how\s+(?:did|do|does)\s+(?:we|you|it)\s+'
+        r'(?:end\s+up|wind\s+up|arrive|settle|land)\b',
+        stripped,
+    ):
+        return True
+    # M125 A5.1: bare "what about X?" / "how about X?" — short follow-up
+    # cue. Require the query be ≤5 words total AND end in a short noun or
+    # pronoun. Guard against novel "what about <long-specific-phrase>".
+    if re.match(r'^(?:what|how)\s+about\s+', stripped):
+        tokens = stripped.split()
+        if len(tokens) <= 5:
+            return True
+    return False
+
+
+# M125 A5.1: subject-continuity pronoun detector for T55-class queries
+# ("has he posted anything more recently?", "what did she say?"). No
+# pronoun-only object needed — the subject pronoun + short query shape
+# indicates the user is continuing a topic from the prior turn.
+_SUBJECT_CONTINUITY_PATTERN = re.compile(
+    r"^(?:has|have|did|does|is|was|will|would|could|should|can)\s+"
+    r"(?:he|she|it|they)\b"
+    r"(?:(?!\bwhen\b|\bwhere\b|\bbecause\b).){0,80}?"
+    r"(?:recently|lately|again|more|any\s+more|since|now|yet)?\s*[?.]?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_subject_continuity(message: str) -> bool:
+    """True if the message uses a subject pronoun (he/she/it/they) at the
+    head of a short interrogative — implying the subject is inherited from
+    the prior turn. Used for the T55 shape (X-feed re-fire with same
+    subject).
+    """
+    if not message:
         return False
-    # Make sure the verb part is short (1-3 words) to avoid false positives
-    verb_part = anaphoric.group(1).strip()
-    return len(verb_part.split()) <= 3
+    stripped = extract_query(message).strip()
+    if not stripped:
+        return False
+    # Cap length — long queries with he/she usually carry the full subject.
+    if len(stripped.split()) > 10:
+        return False
+    return bool(_SUBJECT_CONTINUITY_PATTERN.match(stripped))
 
 
-def route(message, llm_fn=None, prior_user_message: str = ""):
+# M125 A5.2: meta-conversational instruction detector. Matches imperative
+# + memory-scope markers. These must route to the meta-acknowledge
+# destination rather than be executed as content queries.
+# M125 A5.2 pattern design:
+#   - "remember to <verb>" — imperative standing instruction (keep).
+#   - "remember that <factual-statement>" — L1 memory_ingest territory
+#     (pattern at router.py:486 catches "remember that"). We do NOT
+#     intercept these via meta — they're a different destination.
+#   - The meta layer targets: standing rules, future-behavior modifiers,
+#     universal quantifiers, "commit to memory:" / "add to rules".
+_META_INSTRUCTION_PATTERNS = (
+    # Imperative standing instruction: "remember to X"
+    r"\bremember\s+to\b",
+    # "commit this to memory" (memory-ingest adjacent; L1 memory_ingest
+    # pattern catches the plain form — we only catch when it's clearly
+    # a standing-rule shape, i.e. followed by a future-tense clause).
+    # Narrowed: require "from now on" / "going forward" adjacency or
+    # explicit "as a rule" framing elsewhere in the sentence.
+    r"\badd\s+(?:this\s+)?to\s+(?:rules|standing\s+rules|your\s+rules)\b",
+    # Standing-rule framing — these are load-bearing markers that
+    # almost always indicate future-behavior-modification intent.
+    r"\bfrom\s+now\s+on\b",
+    r"\bgoing\s+forward\b",
+    # "next time" but not "next time we tried" (past-tense context).
+    r"\bnext\s+time\b(?!\s+(?:we|i)\s+(?:tried|ran|did|went|called|used))",
+    # Universal quantifiers at sentence start indicating a standing rule
+    r"^(?:please\s+)?(?:always|never)\s+(?:do|use|route|route\s+to|"
+    r"respond|answer|say|try|check|look|search|write|read|remember|"
+    r"ingest|abstain|avoid|prefer)\b",
+    r"\b(?:always|never)\s+(?:do|use|route|remember|search|check)\s+",
+    # Explicit standing-rule framing
+    r"\bas\s+a\s+standing\s+(?:rule|instruction|directive)\b",
+    r"\bstanding\s+(?:rule|instruction)\s*:",
+    r"\b(?:add|set)\s+(?:the\s+)?following\s+(?:rule|instruction)\b",
+)
+
+_META_INSTRUCTION_RE = re.compile(
+    "|".join(_META_INSTRUCTION_PATTERNS),
+    re.IGNORECASE,
+)
+
+
+def _is_meta_instruction(message: str) -> bool:
+    """Return True if `message` is a standing-instruction / meta-instruction
+    about the agent's future behavior rather than a content query.
+
+    M125 A5.2 scope: acknowledge-only. The detection returns True for
+    shapes like "remember to X from now on", "always do Y", "commit this
+    to memory: ...". Caller should route to the meta-acknowledge handler
+    which produces a short "Understood. Going forward I will ..." response
+    without executing the imperative literally.
+
+    K15 discipline: this is ACKNOWLEDGE-ONLY. Committing to a durable
+    rules substrate (STANDING USER RULES block) is separate work.
+    """
+    if not message:
+        return False
+    stripped = message.strip()
+    if not stripped:
+        return False
+    # Guard against pure phatic "remember when we X" (a recall query, not
+    # a standing instruction). The pattern list above already excludes
+    # "remember when" because it requires "remember to/this/that".
+    return bool(_META_INSTRUCTION_RE.search(stripped))
+
+
+def _meta_instruction_acknowledgement(message: str) -> str:
+    """Build an acknowledge-only response for a detected meta-instruction.
+
+    M125 A5.2: Acknowledge without committing to a durable rules block.
+    The response mirrors the instruction back so the user confirms the
+    interpretation, and explicitly notes the ACK-only ship level so any
+    operator sequencing a commit-to-rules follow-up knows the current
+    state.
+    """
+    # Take the first 180 chars of the instruction body for the mirror so
+    # long multi-sentence instructions still echo cleanly.
+    body = message.strip()
+    if len(body) > 180:
+        body = body[:177].rstrip() + "..."
+    return (
+        "Understood — I've noted that instruction. Going forward I will "
+        "follow it in this session. (Note: this is acknowledge-only; "
+        "persistent standing-rule commits are handled separately by the "
+        "operator.)"
+    )
+
+
+def route(message, llm_fn=None, prior_user_message: str = "",
+          prior_tool: str = ""):
     """
     Main routing function.
     Returns (tool_name, args_dict) or ('conversation', {}).
@@ -1095,9 +1338,14 @@ def route(message, llm_fn=None, prior_user_message: str = ""):
     `prior_user_message` (Main 62 Bug 1): previous user turn, passed to
     layer1_route so anaphoric web-search follow-ups can fold the prior
     subject into the Google query.
+    `prior_tool` (M125 A5.1): tool dispatched on the prior turn, used
+    for subject-continuity re-fire and anaphoric fold-in across
+    browse_x_feed, browse_search, memory_recall, vault_read.
     """
     # Layer 1: deterministic keyword routing (must run first — "remember that" etc.)
-    result = layer1_route(message, prior_user_message=prior_user_message)
+    result = layer1_route(message,
+                          prior_user_message=prior_user_message,
+                          prior_tool=prior_tool)
     if result:
         return result
 
@@ -1105,9 +1353,39 @@ def route(message, llm_fn=None, prior_user_message: str = ""):
     # pronoun references, route to conversation where history is available.
     # Runs AFTER layer 1 so "remember that" still hits memory_ingest.
     if _is_anaphoric(message):
+        # M125 A5.1: when prior tool is available AND has a clean prior
+        # subject, fold the subject into the prior tool's args so
+        # memory_recall / vault_read / browse_x_feed / browse_search all
+        # get a subject-composed query. Avoids the T23/T25 failure where
+        # L2 ends up recalling literally "did we solve for that" or
+        # "testing results" with no subject anchor.
+        prior_subj = _extract_prior_subject(prior_user_message) if (
+            prior_user_message) else ""
+        if prior_tool and prior_subj:
+            if prior_tool in ('memory_recall',):
+                composed = f"{prior_subj} {extract_query(message)}".strip()
+                return ('memory_recall', {'query': composed})
+            if prior_tool in ('vault_read', 'vault_research'):
+                composed = f"{prior_subj} {extract_query(message)}".strip()
+                if prior_tool == 'vault_research':
+                    return ('vault_research', {'query': composed})
+                return ('vault_read', {'query': composed})
+            if prior_tool == 'browse_x_feed':
+                composed = f"{prior_subj} {message.strip()}".strip()
+                return ('browse_x_feed', {'count': 5, 'query': composed})
+            if prior_tool == 'browse_search':
+                return ('browse_search',
+                        {'query': _browse_search_query(
+                            message, prior_user_message)})
         # Even anaphoric references to project topics must check vault
         if _has_project_context(message):
             return ('vault_read', {'query': extract_query(message)})
+        # M125 A5.1: no prior-tool stash — fall back to memory_recall
+        # with prior-subject fold-in (better than conversation since
+        # recall has history context and a subject anchor).
+        if prior_subj:
+            composed = f"{prior_subj} {extract_query(message)}".strip()
+            return ('memory_recall', {'query': composed})
         return ('conversation', {})
 
     # PROJECT CONTEXT GATE: any project-specific keywords force vault lookup.

@@ -435,7 +435,8 @@ def parse_max_tokens_from_rules(standing_rules, default_max=None):
 
 def build_messages(history, user_msg, tool_name=None, tool_args=None,
                    tool_result=None, memory_context=None, briefing=None,
-                   query_mode=None, standing_rules=None):
+                   query_mode=None, standing_rules=None,
+                   expand_history_on_low_recall=False):
     """Build the message list with full context assembly.
 
     Context budget (~14K usable tokens):
@@ -446,6 +447,19 @@ def build_messages(history, user_msg, tool_name=None, tool_args=None,
       Tool result / memories:            ~2000 tokens
       User message:                      variable
       Reserved for generation:           ~2000 tokens min
+
+    M113 gamma — recall-quality regime gate:
+      When tool_name+tool_result are set, the default contracted regime
+      keeps only history[-4:] (last 2 user/assistant pairs). Under
+      M108 Finding 2, this structurally evicts earlier conversation
+      content (e.g. T25 information-theory answer dropped at T30 because
+      T27/T28 are the newer pairs). When the caller signals that the
+      tool's own recall returned a low max_score (i.e. the tool cannot
+      rescue the evicted context either), we flip to the expanded
+      regime's history walk so the follow-up query can still resolve
+      against the model's conversation memory. The tool_result tail is
+      preserved in both regimes — flipping only widens history, it does
+      not drop the tool grounding.
     """
     # Assemble system prompt — Main 25 Build 0: keep this byte-stable across
     # turns within a session so the verifier's prefix KV cache hits. Per-query
@@ -479,8 +493,26 @@ def build_messages(history, user_msg, tool_name=None, tool_args=None,
     messages = [{"role": "system", "content": system}]
 
     if tool_name and tool_result is not None:
-        # Tool synthesis: limited history + tool result
-        recent = history[-4:] if len(history) > 4 else history
+        # Tool synthesis: limited history + tool result.
+        # M113 gamma: under expand_history_on_low_recall, walk full
+        # history like the conversation branch (16000 char budget)
+        # instead of capping to the last 2 pairs. The tool_result tail
+        # is still appended below — this only widens the conversation
+        # window so follow-up queries can resolve against earlier turns
+        # that the contracted regime would structurally evict.
+        if expand_history_on_low_recall:
+            char_budget = 16000
+            total_chars = 0
+            history_to_include = []
+            for _msg in reversed(history):
+                msg_chars = len(_msg.get("content", ""))
+                if total_chars + msg_chars > char_budget:
+                    break
+                history_to_include.insert(0, _msg)
+                total_chars += msg_chars
+            recent = history_to_include
+        else:
+            recent = history[-4:] if len(history) > 4 else history
         for msg in recent:
             messages.append(msg)
 

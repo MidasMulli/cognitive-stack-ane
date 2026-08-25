@@ -432,22 +432,7 @@ class LocalMemoryStore:
             score = similarity * (1 - recency_weight) + rec * recency_weight
             meta = self._row_to_meta(r)
             if meta.get("source_role") == "canonical":
-                if (meta.get("type") or "") == "canonical_atom":
-                    # M125.2 A — atomic-row cosine-dominant scorer.
-                    # Ports the multi_path_retrieve.py:619-621 pattern to the
-                    # production hot path. canonical_atom rows (A3 atomic
-                    # ingestion, 336 rows) have empty entities/impacts, so the
-                    # generic canonical 1.30× boost over a recency-weighted
-                    # score leaves fused ≈ 0.25-0.35, below midas_ui's 0.40
-                    # filter threshold. Cosine-dominant scorer with
-                    # CANONICAL_ATOM_BOOST = 1.80 mirrors the claude_automemory
-                    # path and surfaces atomic rows at ~0.50-0.60 for typical
-                    # cosine 0.30-0.40 matches. See
-                    # m125_1_a_pool_reachability.md for mechanism and
-                    # m125_2_a_correct_location.md for hot-path evidence.
-                    score = (0.85 * similarity + 0.15 * rec) * 1.80
-                else:
-                    score *= 1.30
+                score *= 1.30
             # Provenance authority: model-generated content scores lower
             # than human-provided or vault-sourced content. Prevents
             # self-reinforcing hallucination loops where the system
